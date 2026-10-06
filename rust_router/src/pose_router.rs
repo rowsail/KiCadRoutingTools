@@ -192,17 +192,22 @@ impl PoseRouter {
     #[allow(clippy::too_many_arguments)]
     pub fn route_pose(
         &self,
+        py: Python<'_>,
         obstacles: &GridObstacleMap,
         src_x: i32, src_y: i32, src_layer: u8, src_theta_idx: u8,
         tgt_x: i32, tgt_y: i32, tgt_layer: u8, tgt_theta_idx: u8,
         max_iterations: u32,
         diff_pair_via_spacing: Option<i32>,
     ) -> (Option<Vec<(i32, i32, u8, u8)>>, u32, Vec<i8>) {
-        let mut sink = NullSink;
-        self.pose_search(obstacles,
-                         src_x, src_y, src_layer, src_theta_idx,
-                         tgt_x, tgt_y, tgt_layer, tgt_theta_idx,
-                         max_iterations, diff_pair_via_spacing, &mut sink)
+        // Option 3: release the GIL for the pure-Rust search so other
+        // Python threads (KiCad's UI, parallel rescue workers) keep running.
+        py.allow_threads(|| {
+            let mut sink = NullSink;
+            self.pose_search(obstacles,
+                             src_x, src_y, src_layer, src_theta_idx,
+                             tgt_x, tgt_y, tgt_layer, tgt_theta_idx,
+                             max_iterations, diff_pair_via_spacing, &mut sink)
+        })
     }
 
     /// Route with frontier analysis - returns blocked cells on failure.
@@ -219,23 +224,28 @@ impl PoseRouter {
     #[allow(clippy::too_many_arguments)]
     pub fn route_pose_with_frontier(
         &self,
+        py: Python<'_>,
         obstacles: &GridObstacleMap,
         src_x: i32, src_y: i32, src_layer: u8, src_theta_idx: u8,
         tgt_x: i32, tgt_y: i32, tgt_layer: u8, tgt_theta_idx: u8,
         max_iterations: u32,
         diff_pair_via_spacing: Option<i32>,
     ) -> (Option<Vec<(i32, i32, u8, u8)>>, u32, Vec<(i32, i32, u8)>, Vec<i8>) {
-        let mut sink = FrontierSink::new();
-        let (path, iterations, gnd_via_dirs) = self.pose_search(
-            obstacles,
-            src_x, src_y, src_layer, src_theta_idx,
-            tgt_x, tgt_y, tgt_layer, tgt_theta_idx,
-            max_iterations, diff_pair_via_spacing, &mut sink);
-        if path.is_some() {
-            (path, iterations, Vec::new(), gnd_via_dirs)
-        } else {
-            (None, iterations, sink.tracker.get_blocked(), Vec::new())
-        }
+        // Option 3: release the GIL for the pure-Rust search so other
+        // Python threads (KiCad's UI, parallel rescue workers) keep running.
+        py.allow_threads(|| {
+            let mut sink = FrontierSink::new();
+            let (path, iterations, gnd_via_dirs) = self.pose_search(
+                obstacles,
+                src_x, src_y, src_layer, src_theta_idx,
+                tgt_x, tgt_y, tgt_layer, tgt_theta_idx,
+                max_iterations, diff_pair_via_spacing, &mut sink);
+            if path.is_some() {
+                (path, iterations, Vec::new(), gnd_via_dirs)
+            } else {
+                (None, iterations, sink.tracker.get_blocked(), Vec::new())
+            }
+        })
     }
 }
 

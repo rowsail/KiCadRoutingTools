@@ -1149,6 +1149,7 @@ impl GridRouter {
     #[allow(clippy::too_many_arguments)]
     pub fn route_multi(
         &self,
+        py: Python<'_>,
         obstacles: &GridObstacleMap,
         sources: Vec<(i32, i32, u8)>,
         targets: Vec<(i32, i32, u8)>,
@@ -1165,48 +1166,52 @@ impl GridRouter {
         grace_tranches: u32,
         via_rung: usize,
     ) -> (Option<Vec<(i32, i32, u8)>>, u32, std::collections::HashMap<String, f64>) {
-        let mut opts = SearchOptions::new(collinear_vias, via_exclusion_radius,
-                                      start_direction, end_direction,
-                                      direction_steps, track_margin);
-        opts.via_rung = via_rung;
-        let mut sink = StatsSink::default();
-        let mut search = GridSearch::new(self, sources, targets, max_iterations, opts, &mut sink);
-        search.set_iteration_ceiling(max_iterations_ceiling, quantum_cells, quantum_pct, grace_tranches);
-        sink.stats.initial_h = search.initial_h;
+        // Option 3: release the GIL for the pure-Rust search so other
+        // Python threads (KiCad's UI, parallel rescue workers) keep running.
+        py.allow_threads(|| {
+            let mut opts = SearchOptions::new(collinear_vias, via_exclusion_radius,
+                                          start_direction, end_direction,
+                                          direction_steps, track_margin);
+            opts.via_rung = via_rung;
+            let mut sink = StatsSink::default();
+            let mut search = GridSearch::new(self, sources, targets, max_iterations, opts, &mut sink);
+            search.set_iteration_ceiling(max_iterations_ceiling, quantum_cells, quantum_pct, grace_tranches);
+            sink.stats.initial_h = search.initial_h;
 
-        loop {
-            match search.step(self, obstacles, &mut sink) {
-                SearchStep::Found(goal_idx, g) => {
-                    let path = search.store.reconstruct_path(goal_idx);
-                    let stats = &mut sink.stats;
-                    stats.path_length = path.len() as u32;
-                    stats.path_cost = g;
-                    stats.final_g = g;
-                    stats.best_h = search.best_h;
-                    stats.iteration_tranches = search.tranches_granted;
-                    stats.open_set_size = search.open_set.len() as u32;
-                    stats.closed_set_size = search.store.closed_len();
-                    // Count vias in path
-                    for i in 1..path.len() {
-                        if path[i].2 != path[i - 1].2 {
-                            stats.via_count += 1;
+            loop {
+                match search.step(self, obstacles, &mut sink) {
+                    SearchStep::Found(goal_idx, g) => {
+                        let path = search.store.reconstruct_path(goal_idx);
+                        let stats = &mut sink.stats;
+                        stats.path_length = path.len() as u32;
+                        stats.path_cost = g;
+                        stats.final_g = g;
+                        stats.best_h = search.best_h;
+                        stats.iteration_tranches = search.tranches_granted;
+                        stats.open_set_size = search.open_set.len() as u32;
+                        stats.closed_set_size = search.store.closed_len();
+                        // Count vias in path
+                        for i in 1..path.len() {
+                            if path[i].2 != path[i - 1].2 {
+                                stats.via_count += 1;
+                            }
                         }
+                        let stats_dict = self.stats_to_dict(&sink.stats);
+                        return (Some(path), search.iterations, stats_dict);
                     }
-                    let stats_dict = self.stats_to_dict(&sink.stats);
-                    return (Some(path), search.iterations, stats_dict);
+                    SearchStep::IterationCap | SearchStep::Exhausted => break,
+                    SearchStep::Progress(_) | SearchStep::Skipped => {}
                 }
-                SearchStep::IterationCap | SearchStep::Exhausted => break,
-                SearchStep::Progress(_) | SearchStep::Skipped => {}
             }
-        }
 
-        // No path found - fill in final stats
-        sink.stats.best_h = search.best_h;
-        sink.stats.iteration_tranches = search.tranches_granted;
-        sink.stats.open_set_size = search.open_set.len() as u32;
-        sink.stats.closed_set_size = search.store.closed_len();
-        let stats_dict = self.stats_to_dict(&sink.stats);
-        (None, search.iterations, stats_dict)
+            // No path found - fill in final stats
+            sink.stats.best_h = search.best_h;
+            sink.stats.iteration_tranches = search.tranches_granted;
+            sink.stats.open_set_size = search.open_set.len() as u32;
+            sink.stats.closed_set_size = search.store.closed_len();
+            let stats_dict = self.stats_to_dict(&sink.stats);
+            (None, search.iterations, stats_dict)
+        })
     }
 
     /// Route with frontier analysis - returns blocked cells on failure.
@@ -1227,6 +1232,7 @@ impl GridRouter {
     #[allow(clippy::too_many_arguments)]
     pub fn route_with_frontier(
         &self,
+        py: Python<'_>,
         obstacles: &GridObstacleMap,
         sources: Vec<(i32, i32, u8)>,
         targets: Vec<(i32, i32, u8)>,
@@ -1243,26 +1249,30 @@ impl GridRouter {
         grace_tranches: u32,
         via_rung: usize,
     ) -> (Option<Vec<(i32, i32, u8)>>, u32, Vec<(i32, i32, u8)>) {
-        let mut opts = SearchOptions::new(collinear_vias, via_exclusion_radius,
-                                      start_direction, end_direction,
-                                      direction_steps, track_margin);
-        opts.via_rung = via_rung;
-        let mut sink = FrontierSink::new();
-        let mut search = GridSearch::new(self, sources, targets, max_iterations, opts, &mut sink);
-        search.set_iteration_ceiling(max_iterations_ceiling, quantum_cells, quantum_pct, grace_tranches);
+        // Option 3: release the GIL for the pure-Rust search so other
+        // Python threads (KiCad's UI, parallel rescue workers) keep running.
+        py.allow_threads(|| {
+            let mut opts = SearchOptions::new(collinear_vias, via_exclusion_radius,
+                                          start_direction, end_direction,
+                                          direction_steps, track_margin);
+            opts.via_rung = via_rung;
+            let mut sink = FrontierSink::new();
+            let mut search = GridSearch::new(self, sources, targets, max_iterations, opts, &mut sink);
+            search.set_iteration_ceiling(max_iterations_ceiling, quantum_cells, quantum_pct, grace_tranches);
 
-        loop {
-            match search.step(self, obstacles, &mut sink) {
-                SearchStep::Found(goal_idx, _g) => {
-                    let path = search.store.reconstruct_path(goal_idx);
-                    return (Some(path), search.iterations, Vec::new());
+            loop {
+                match search.step(self, obstacles, &mut sink) {
+                    SearchStep::Found(goal_idx, _g) => {
+                        let path = search.store.reconstruct_path(goal_idx);
+                        return (Some(path), search.iterations, Vec::new());
+                    }
+                    SearchStep::IterationCap | SearchStep::Exhausted => break,
+                    SearchStep::Progress(_) | SearchStep::Skipped => {}
                 }
-                SearchStep::IterationCap | SearchStep::Exhausted => break,
-                SearchStep::Progress(_) | SearchStep::Skipped => {}
             }
-        }
 
-        (None, search.iterations, sink.tracker.get_blocked())
+            (None, search.iterations, sink.tracker.get_blocked())
+        })
     }
 }
 
