@@ -2673,8 +2673,23 @@ def _chain_segments_into_contours(segments: List[Tuple[Tuple[float, float], Tupl
         for seg in group_segs:
             endpoints.append(seg[0])
             endpoints.append(seg[1])
-        loose = [p for p in endpoints
-                 if sum(1 for q in endpoints if approx_equal(p, q)) == 1]
+        # Partner count per endpoint via the same 2*tol buckets as above (a
+        # point within tol of p is in p's bucket or a neighbour), instead of
+        # comparing every endpoint pair: an outline with arcs is thousands of
+        # segments, and the all-pairs count was ~21M approx_equal calls per
+        # route. Same count, so the same loose ends in the same order.
+        ep_buckets = defaultdict(list)
+        for q in endpoints:
+            ep_buckets[(int(q[0] / bucket_size),
+                        int(q[1] / bucket_size))].append(q)
+
+        def _partner_count(p):
+            bx = int(p[0] / bucket_size)
+            by = int(p[1] / bucket_size)
+            return sum(1 for dbx in (-1, 0, 1) for dby in (-1, 0, 1)
+                       for q in ep_buckets.get((bx + dbx, by + dby), ())
+                       if approx_equal(p, q))
+        loose = [p for p in endpoints if _partner_count(p) == 1]
         start_idx, start_flip = 0, False
         if len(loose) == 2:
             for i, seg in enumerate(group_segs):
