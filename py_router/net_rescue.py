@@ -304,6 +304,12 @@ def _closest_pair(points_a, points_b):
     return best
 
 
+# Per-build records build_base_obstacle_map writes onto the board it builds
+# from (see _pristine_rescue_map).
+_BUILD_RECORDS = ('_net_tie_lift', '_net_tie_price',
+                  '_graphic_own_pad_lift', '_graphic_own_pad_via_lift')
+
+
 def _pristine_rescue_map(board, parent_pcb, cfg, net_id, net_clearances,
                          scope_key):
     """Per-board LRU of PRISTINE rescue obstacle maps (2026-08-14 profiling:
@@ -354,7 +360,8 @@ def _pristine_rescue_map(board, parent_pcb, cfg, net_id, net_clearances,
                                            net_clearances=net_clearances)
         entry = (pristine,
                  (getattr(board, '_graphic_own_pad_lift', None) or {}).get(net_id),
-                 (getattr(board, '_graphic_own_pad_via_lift', None) or {}).get(net_id))
+                 (getattr(board, '_graphic_own_pad_via_lift', None) or {}).get(net_id),
+                 {_k: getattr(board, _k, None) for _k in _BUILD_RECORDS})
         # Stale-epoch entries can never hit again; drop them first, then LRU.
         for k in [k for k in cache if k[2] != epoch]:
             del cache[k]
@@ -363,7 +370,16 @@ def _pristine_rescue_map(board, parent_pcb, cfg, net_id, net_clearances,
             cache.popitem(last=False)
     else:
         cache.move_to_end(key)
-    pristine, _op_cells, _op_vias = entry
+        # The build writes its records onto `board`, and routing reads the
+        # net-tie ones back from it (routing_context). On a hit no build ran,
+        # so put back THIS map's records -- otherwise the route reads
+        # whichever build ran last, possibly another rung's (the #977 rule:
+        # the record a map is read with must be that map's own). This also
+        # makes a hit and a miss leave identical state, which the speculative
+        # rung workers (rescue_parallel) rely on.
+        for _k, _v in entry[3].items():
+            setattr(board, _k, _v)
+    pristine, _op_cells, _op_vias, _records = entry
     obstacles = pristine.clone_fresh()
     # No restore: the clone is this attempt's own map and is discarded with it.
     if _op_cells is not None and len(_op_cells):
