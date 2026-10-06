@@ -552,7 +552,9 @@ def _attempt_edge(pcb_data, net_id, gap, config, net_clearances,
     # obstacles still apply in full).
     if config.bga_exclusion_zones:
         config = replace(config, bga_exclusion_zones=[])
-    for cfg in _rescue_rungs(config, fine_grid, pcb_data, net_id):
+    def _rung(cfg):
+        """One rung of the ladder: the routed result, or None to fall
+        through to the next rung."""
         # Rung 0 keeps the run's exact clearance semantics (incl. per-netclass
         # spacing). The neck-down rungs' whole point is spacing below nominal
         # FOR THE RESCUED NET, so its own map entry is dropped (the builder's
@@ -641,7 +643,7 @@ def _attempt_edge(pcb_data, net_id, gap, config, net_clearances,
             if strict_endpoints:
                 # #570: no anchors for THIS gap's sides -> nothing this
                 # window can honestly route. Do not weld a random pair.
-                continue
+                return None
             src_over = tgt_over = None
         result = route_net_with_obstacles(window, net_id, cfg, obstacles, bounds=bounds,
                                           sources_override=src_over,
@@ -650,7 +652,7 @@ def _attempt_edge(pcb_data, net_id, gap, config, net_clearances,
             if _result_escapes_window(result, window, cfg):
                 print(f"    rescue rung rejected: route escaped the window "
                       f"bounds (fence leak) net={net_id}")
-                continue
+                return None
             _tie_bad = _tie_band_violations(
                 pcb_data, net_id, cfg, result.get('new_segments') or [])
             if _tie_bad:
@@ -659,9 +661,17 @@ def _attempt_edge(pcb_data, net_id, gap, config, net_clearances,
                       f"ride net-tie partner pad "
                       f"{_p.component_ref}.{_p.pad_number} sub-clearance "
                       f"beyond KiCad's waiver (worst {_d:.3f}mm)")
-                continue
-            return result, cfg
-    return None, None
+                return None
+            return result
+        return None
+
+    # Rungs are independent searches from the same state; rescue_parallel
+    # may try later rungs speculatively in forked workers (CLI only) while
+    # keeping the serial outcome exactly (see its docstring).
+    from rescue_parallel import run_ladder
+    return run_ladder(list(_rescue_rungs(config, fine_grid, pcb_data, net_id)),
+                      _rung, watch=(pcb_data, window),
+                      rung_scoped=_BUILD_RECORDS)
 
 
 def _tie_band_violations(pcb_data, net_id, cfg, segments):
