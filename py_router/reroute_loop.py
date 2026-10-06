@@ -297,9 +297,9 @@ def run_reroute_loop(
 
             # Update progress for reroute
             if progress_callback:
-                msg = f"Reroute: {ripped_net_name}"
+                msg = f"Reroute: {ripped_net_name} \u00b7 {successful} re-routed"
                 if total_failed > 0:
-                    msg += f" ({total_failed} failed)"
+                    msg += f", {total_failed} failed"
                 progress_callback(route_index, current_total, msg)
 
             # Calculate stub length before routing
@@ -834,9 +834,9 @@ def run_reroute_loop(
 
             # Update progress for diff pair reroute
             if progress_callback:
-                msg = f"Reroute: {ripped_pair_name}"
+                msg = f"Reroute: {ripped_pair_name} \u00b7 {successful} re-routed"
                 if total_failed > 0:
-                    msg += f" ({total_failed} failed)"
+                    msg += f", {total_failed} failed"
                 progress_callback(route_index, current_total, msg)
 
             start_time = time.time()

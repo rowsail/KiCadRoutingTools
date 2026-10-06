@@ -875,8 +875,11 @@ def rescue_failed_nets(state, single_ended_nets, net_clearances=None,
             print("  Rescue cancelled")
             break
         if progress_callback:
-            progress_callback(_cand_idx + 1, len(candidates),
-                              f"Rescue: {net_name}")
+            progress_callback(
+                _cand_idx + 1, len(candidates),
+                f"Rescue: {net_name} \u00b7 {len(summary['recovered'])} "
+                f"recovered, {len(summary['improved'])} improved, "
+                f"{len(summary['unchanged'])} unchanged")
         net_start = time.time()
         num0, comp_points, comp_pads = _net_component_info(pcb_data, net_id)
         if num0 <= 1:

@@ -622,9 +622,11 @@ def route_single_ended_nets(
 
         # Report progress
         if progress_callback is not None:
-            msg = net_name
+            # Live tallies for the dialog's status line (routed so far,
+            # failed so far); the GUI appends (route_index/total_routes).
+            msg = f"{net_name} \u00b7 {successful} routed"
             if failed > 0:
-                msg += f" ({failed} failed)"
+                msg += f", {failed} failed"
             progress_callback(route_index, total_routes, msg)
 
         # Periodic memory reporting (every 10 nets)

@@ -2743,9 +2743,20 @@ def route_disconnected_regions(
                         if edge_idx + 1 != join_no else "")
         seed_note = f" (seed {len(seed_i)}x{len(seed_j)})" if reduced else ""
         print(f"    [{join_no}/{planned}{attempt_note}] Component {root_i} ({len(comp_members[root_i])} region(s), {len(anchors_i)} pts) <-> Component {root_j} ({len(comp_members[root_j])} region(s), {len(anchors_j)} pts){seed_note}...", end=" ", flush=True)
-        if progress_callback:
-            progress_callback(join_no, planned,
-                              f"{net_name}: connecting plane regions")
+        def _report(stage=""):
+            # Live status for the dialog: joins done/needed come from the
+            # GUI's "(current/total)"; failures, the attempt number and the
+            # escalation stage under way are appended to the label.
+            if not progress_callback:
+                return
+            label = f"{net_name}: joining plane regions"
+            if routes_failed:
+                label += (f" \u00b7 {routes_failed} failed, "
+                          f"attempt {edge_idx + 1}")
+            if stage:
+                label += f" \u00b7 {stage}"
+            progress_callback(join_no, planned, label)
+        _report()
 
         def _connect(a_i, a_j):
             return _try_route_between_regions(
@@ -2776,6 +2787,7 @@ def route_disconnected_regions(
         # connection that the full set would have found.
         if result is None and reduced:
             print(f"{YELLOW}retry-full{RESET} ", end="", flush=True)
+            _report("retry-full")
             result, track_width, open_space_via, _ex2 = _connect(full_i, full_j)
             _exhausted = _exhausted or _ex2
 
@@ -2789,6 +2801,7 @@ def route_disconnected_regions(
         # iterations per genuinely-impossible edge (review finding).
         if result is None and max_iterations < 1_000_000 and _exhausted:
             print(f"{YELLOW}budget-x5{RESET} ", end="", flush=True)
+            _report("budget x5")
             result, track_width, open_space_via, _ = _try_route_between_regions(
                 full_i, full_j,
                 base_obstacles=base_obstacles,
@@ -2835,6 +2848,7 @@ def route_disconnected_regions(
                         hole_to_hole_clearance)
             print(f"{YELLOW}narrow-width {config.track_width:.3f}{RESET} ",
                   end="", flush=True)
+            _report(f"narrow width {config.track_width:.3f}")
             result, track_width, open_space_via, _ = _try_route_between_regions(
                 full_i, full_j,
                 base_obstacles=narrow_obstacles,
