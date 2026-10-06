@@ -36,6 +36,7 @@ from bga_fanout.types import BGAGrid
 from bga_fanout.geometry import clamp_via_to_pad
 from list_nets import fab_floors, fab_floor_ladder, fab_floor_min, warn_fab_escalation
 from routing_defaults import HOLE_TO_HOLE_CLEARANCE
+from routing_utils import _rust_raster
 
 
 def _custom_polys(pad):
@@ -169,7 +170,14 @@ class _Occ:
         with the original arithmetic so floating-point rounding can never
         flip a boundary cell), but computed with one sqrt per column instead
         of float math per cell. The 28.6M-yield _disk generator was 42% of a
-        BGA fanout profile; the block_* writers blit these spans instead."""
+        BGA fanout profile; the block_* writers blit these spans instead.
+
+        Uses grid_router.disk_spans (an exact Rust port, rust_router
+        src/raster.rs) when available; this code is the fallback."""
+        rust = _rust_raster('disk_spans')
+        if rust is not None:
+            return rust(float(x), float(y), float(r), float(self.x0),
+                        float(self.y0), float(self.res), self.nx, self.ny)
         fx = (x - self.x0) / self.res
         fy = (y - self.y0) / self.res
         cx, cy = int(fx), int(fy)

@@ -10,6 +10,7 @@ The bulk of routing functionality has been split into:
 from __future__ import annotations
 
 import math
+import os
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -311,7 +312,15 @@ def pad_blocked_cells_array(
         out = np.empty_like(offs)
         np.add(offs, np.array([[pad_gx, pad_gy]], dtype=np.int32), out=out)
         return out
-    rotated = abs(rotation_deg) > 1e-9 and abs(abs(rotation_deg) - 180.0) > 1e-9
+    rust = _rust_raster('pad_offsets')
+    if rust is not None:
+        # Operation-for-operation port of the numpy path below (rust_router
+        # src/raster.rs): identical offsets in identical order.
+        return _memo_pad_offsets(key, rust(
+            float(half_width), float(half_height), float(margin),
+            float(grid_step), float(corner_radius), float(corner_buffer),
+            float(off_x), float(off_y), float(rotation_deg)), pad_gx, pad_gy)
+    rotated =abs(rotation_deg) > 1e-9 and abs(abs(rotation_deg) - 180.0) > 1e-9
     if rotated:
         _rrad = math.radians(rotation_deg)
         _rc, _rs = math.cos(_rrad), math.sin(_rrad)
@@ -373,10 +382,16 @@ def pad_blocked_cells_array(
     dist_sq = np.where(corner_region, corner_dist_sq, rect_dist_sq)
     mask = dist_sq < effective_margin_sq
 
-    global _PAD_OFFSETS_ROWS
     offs = np.empty((int(mask.sum()), 2), dtype=np.int32)
     offs[:, 0] = exg[mask].astype(np.int32)
     offs[:, 1] = eyg[mask].astype(np.int32)
+    return _memo_pad_offsets(key, offs, pad_gx, pad_gy)
+
+
+def _memo_pad_offsets(key, offs, pad_gx, pad_gy):
+    """Memoise freshly computed pad offsets (read-only) and return the cells
+    for this pad position."""
+    global _PAD_OFFSETS_ROWS
     offs.setflags(write=False)
     if _PAD_OFFSETS_ROWS + len(offs) > _PAD_OFFSETS_ROW_CAP:
         _PAD_OFFSETS_CACHE.clear()
@@ -537,12 +552,17 @@ def segment_blocked_spans(x1: float, y1: float, x2: float, y2: float,
 
     Read-only and shared, exactly like the cell form.
     """
-    global _SEG_SPAN_ROWS
     key = (x1, y1, x2, y2, margin, grid_step)
     cached = _SEG_SPAN_CACHE.get(key)
     if cached is not None:
         _SEG_SPAN_CACHE.move_to_end(key)
         return cached
+    rust = _rust_raster('capsule_spans')
+    if rust is not None:
+        # Operation-for-operation port of the numpy path below (rust_router
+        # src/raster.rs): identical spans, no per-call meshgrid.
+        return _memo_spans(key, rust(float(x1), float(y1), float(x2), float(y2),
+                                     float(margin), float(grid_step)))
     xs, ys, _gxg, _gyg, mask = _capsule_mask(x1, y1, x2, y2, margin, grid_step)
     any_col = mask.any(axis=1)
     sel = np.flatnonzero(any_col)
@@ -559,6 +579,12 @@ def segment_blocked_spans(x1: float, y1: float, x2: float, y2: float,
             raise AssertionError("capsule column not contiguous")
     else:
         out = np.empty((0, 3), dtype=np.int32)
+    return _memo_spans(key, out)
+
+
+def _memo_spans(key, out):
+    """Store a freshly computed span array in the span memo (read-only)."""
+    global _SEG_SPAN_ROWS
     out.setflags(write=False)
     _SEG_SPAN_CACHE[key] = out
     _SEG_SPAN_ROWS += len(out)
@@ -567,6 +593,27 @@ def segment_blocked_spans(x1: float, y1: float, x2: float, y2: float,
         _, old_arr = _SEG_SPAN_CACHE.popitem(last=False)
         _SEG_SPAN_ROWS -= len(old_arr)
     return out
+
+
+_RUST_RASTER_CACHE: Dict[str, object] = {}
+
+
+def _rust_raster(name):
+    """grid_router.<name> (a Rust port of a rasterizer here) when the Rust
+    module provides it and KICAD_RUST_RASTER is not 0, else None -> numpy.
+    A failed import is not remembered, so a later call can still pick the
+    module up once rust_router is on sys.path."""
+    if name in _RUST_RASTER_CACHE:
+        return _RUST_RASTER_CACHE[name]
+    if os.environ.get('KICAD_RUST_RASTER', '1') == '0':
+        _RUST_RASTER_CACHE[name] = None
+        return None
+    try:
+        import grid_router
+    except ImportError:
+        return None
+    fn = _RUST_RASTER_CACHE[name] = getattr(grid_router, name, None)
+    return fn
 
 
 def segment_blocked_cells_array(x1: float, y1: float, x2: float, y2: float,

@@ -13,6 +13,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;  // v0.17.3: return free
 
 mod types;
 mod refmap;
+mod raster;
 mod obstacle_map;
 mod router;
 mod dubins;
@@ -145,5 +146,8 @@ fn grid_router(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GridRouter>()?;
     m.add_class::<PoseRouter>()?;
     m.add_function(wrap_pyfunction!(identify_blocking_obstacles, m)?)?;
+    m.add_function(wrap_pyfunction!(raster::capsule_spans, m)?)?;
+    m.add_function(wrap_pyfunction!(raster::pad_offsets, m)?)?;
+    m.add_function(wrap_pyfunction!(raster::disk_spans, m)?)?;
     Ok(())
 }
