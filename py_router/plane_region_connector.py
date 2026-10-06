@@ -2733,11 +2733,18 @@ def route_disconnected_regions(
         _open_ok_j = (lambda _x, _y, _r=root_j:
                       _on_material(_r, (_x, _y), strict=True))
 
-        # Progress indicator
+        # Progress indicator: the join this attempt is for, out of the joins
+        # needed (n_regions - 1). Failed attempts don't join anything, so the
+        # attempt number (edge_idx + 1) can run past `planned`; it is shown
+        # separately once the two differ ("[230/231, attempt 233]") rather
+        # than as a misleading "[233/231]".
+        join_no = min(routes_added + routes_coincident + 1, planned)
+        attempt_note = (f", attempt {edge_idx + 1}"
+                        if edge_idx + 1 != join_no else "")
         seed_note = f" (seed {len(seed_i)}x{len(seed_j)})" if reduced else ""
-        print(f"    [{edge_idx+1}/{planned}] Component {root_i} ({len(comp_members[root_i])} region(s), {len(anchors_i)} pts) <-> Component {root_j} ({len(comp_members[root_j])} region(s), {len(anchors_j)} pts){seed_note}...", end=" ", flush=True)
+        print(f"    [{join_no}/{planned}{attempt_note}] Component {root_i} ({len(comp_members[root_i])} region(s), {len(anchors_i)} pts) <-> Component {root_j} ({len(comp_members[root_j])} region(s), {len(anchors_j)} pts){seed_note}...", end=" ", flush=True)
         if progress_callback:
-            progress_callback(min(edge_idx + 1, planned), planned,
+            progress_callback(join_no, planned,
                               f"{net_name}: connecting plane regions")
 
         def _connect(a_i, a_j):
