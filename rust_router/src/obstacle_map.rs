@@ -5,6 +5,7 @@ use numpy::PyReadonlyArray2;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::types::{pack_xy, unpack_xy};
+use crate::refmap::RefMap;
 
 /// Per-layer bitmap of blocked cells (S2, issue #384). A PURE CACHE of
 /// "refcount > 0" for `GridObstacleMap.blocked_cells`: the refcount hashmaps
@@ -196,7 +197,7 @@ impl BlockedBitmap {
 pub struct GridObstacleMap {
     /// Blocked cells per layer: layer -> map of (gx, gy) packed as u64 -> ref count
     /// A cell is blocked if its ref count > 0
-    pub blocked_cells: Vec<FxHashMap<u64, u16>>,
+    pub blocked_cells: Vec<RefMap>,
     /// S2: per-layer bitmap CACHE of "blocked_cells refcount > 0". Written only
     /// at 0->1 / 1->0 transitions inside the refcount-mutating functions.
     blocked_bitmap: BlockedBitmap,
@@ -218,7 +219,7 @@ pub struct GridObstacleMap {
     /// map, not per-layer).
     static_via_bitmap: BlockedBitmap,
     /// Blocked via positions: packed (gx, gy) -> ref count
-    pub blocked_vias: FxHashMap<u64, u16>,
+    pub blocked_vias: RefMap,
     /// #568 / #530: via blocking at every OTHER via geometry a search may use,
     /// one refcounted map per rung, rung r stored at index r-1 (rung 0 is
     /// `blocked_vias`, the configured via). Rung 1 was the single "small fab
@@ -228,7 +229,7 @@ pub struct GridObstacleMap {
     /// query at that rung falls back to `blocked_vias` (conservative for a
     /// smaller via; callers stamping a LARGER via must populate its map), so
     /// existing single-rung callers behave identically.
-    pub blocked_vias_rungs: Vec<FxHashMap<u64, u16>>,
+    pub blocked_vias_rungs: Vec<RefMap>,
     /// Stub proximity costs: (gx, gy) -> cost
     pub stub_proximity: FxHashMap<u64, i32>,
     /// Layer-specific proximity costs (for track proximity on same layer)
@@ -269,11 +270,11 @@ impl GridObstacleMap {
     #[new]
     pub fn new(num_layers: usize) -> Self {
         Self {
-            blocked_cells: (0..num_layers).map(|_| FxHashMap::default()).collect(),
+            blocked_cells: (0..num_layers).map(|_| RefMap::default()).collect(),
             blocked_bitmap: BlockedBitmap::new(num_layers),
             static_blocked_bitmap: BlockedBitmap::new(num_layers),
             static_via_bitmap: BlockedBitmap::new(1),
-            blocked_vias: FxHashMap::default(),
+            blocked_vias: RefMap::default(),
             blocked_vias_rungs: Vec::new(),
             stub_proximity: FxHashMap::default(),
             layer_proximity_costs: (0..num_layers).map(|_| FxHashMap::default()).collect(),
@@ -411,7 +412,7 @@ impl GridObstacleMap {
             // Take the layer map out to avoid borrowing self while mutating the
             // static bitmap; the dynamic layer map is left empty.
             let m = std::mem::take(&mut self.blocked_cells[layer]);
-            for &key in m.keys() {
+            for key in m.keys() {
                 let (gx, gy) = unpack_xy(key);
                 self.static_blocked_bitmap.set(gx, gy, layer);
             }
@@ -419,7 +420,7 @@ impl GridObstacleMap {
         // The dynamic bitmap cached exactly these (now-frozen) cells; reset it.
         self.blocked_bitmap = BlockedBitmap::new(self.num_layers);
         let mv = std::mem::take(&mut self.blocked_vias);
-        for &key in mv.keys() {
+        for key in mv.keys() {
             let (gx, gy) = unpack_xy(key);
             self.static_via_bitmap.set(gx, gy, 0);
         }
@@ -430,14 +431,14 @@ impl GridObstacleMap {
         // when it is a subset of what was frozen (#530); otherwise its cells
         // beyond the frozen set are kept as a dynamic overlay.
         for m in self.blocked_vias_rungs.iter_mut() {
-            let extra: Vec<u64> = m.keys().copied()
+            let extra: Vec<u64> = m.keys()
                 .filter(|k| { let (gx, gy) = unpack_xy(*k); !self.static_via_bitmap.test(gx, gy, 0) })
                 .collect();
             if extra.is_empty() {
                 m.clear();
             } else {
-                let mut keep = FxHashMap::default();
-                for k in extra { keep.insert(k, *m.get(&k).unwrap_or(&1)); }
+                let mut keep = RefMap::default();
+                for k in extra { keep.insert(k, m.get(&k).unwrap_or(1)); }
                 *m = keep;
             }
         }
@@ -452,14 +453,14 @@ impl GridObstacleMap {
         let mut ge2 = 0usize;
         let mut maxc = 0usize;
         for layer in &self.blocked_cells {
-            for &c in layer.values() {
+            for c in layer.values() {
                 distinct += 1;
                 if c >= 2 { ge2 += 1; }
                 if c as usize > maxc { maxc = c as usize; }
             }
         }
         let vd = self.blocked_vias.len();
-        let vge2 = self.blocked_vias.values().filter(|&&c| c >= 2).count();
+        let vge2 = self.blocked_vias.values().filter(|&c| c >= 2).count();
         (distinct, ge2, maxc, vd, vge2)
     }
 
@@ -550,9 +551,8 @@ impl GridObstacleMap {
     pub fn add_blocked_cell(&mut self, gx: i32, gy: i32, layer: usize) {
         if layer < self.num_layers {
             let key = pack_xy(gx, gy);
-            let cnt = self.blocked_cells[layer].entry(key).or_insert(0);
-            *cnt += 1;
-            if *cnt == 1 {
+            let cnt = self.blocked_cells[layer].inc(key);
+            if cnt == 1 {
                 self.blocked_bitmap.set(gx, gy, layer); // S2: 0->1 transition
             }
         }
@@ -561,7 +561,7 @@ impl GridObstacleMap {
     /// Add a blocked via position (increments reference count)
     pub fn add_blocked_via(&mut self, gx: i32, gy: i32) {
         let key = pack_xy(gx, gy);
-        *self.blocked_vias.entry(key).or_insert(0) += 1;
+        self.blocked_vias.inc(key);
     }
 
     /// #568: add/remove a SMALL-rung (rung 1) blocked via (refcounted, mirrors
@@ -600,21 +600,17 @@ impl GridObstacleMap {
     pub fn add_blocked_via_rung(&mut self, rung: usize, gx: i32, gy: i32) {
         if rung == 0 { self.add_blocked_via(gx, gy); return; }
         let key = pack_xy(gx, gy);
-        *self.rung_map_mut(rung).entry(key).or_insert(0) += 1;
+        self.rung_map_mut(rung).inc(key);
     }
 
     pub fn remove_blocked_via_rung(&mut self, rung: usize, gx: i32, gy: i32) {
         let key = pack_xy(gx, gy);
         if rung == 0 {
-            if let Some(count) = self.blocked_vias.get_mut(&key) {
-                if *count > 1 { *count -= 1; } else { self.blocked_vias.remove(&key); }
-            }
+            self.blocked_vias.dec(key);
             return;
         }
         let m = self.rung_map_mut(rung);
-        if let Some(count) = m.get_mut(&key) {
-            if *count > 1 { *count -= 1; } else { m.remove(&key); }
-        }
+        m.dec(key);
     }
 
     pub fn add_blocked_vias_rung_batch(&mut self, rung: usize, vias: PyReadonlyArray2<i32>) {
@@ -623,7 +619,7 @@ impl GridObstacleMap {
         let m = self.rung_map_mut(rung);
         for row in arr.rows() {
             let key = pack_xy(row[0], row[1]);
-            *m.entry(key).or_insert(0) += 1;
+            m.inc(key);
         }
     }
 
@@ -633,9 +629,7 @@ impl GridObstacleMap {
         let m = self.rung_map_mut(rung);
         for row in arr.rows() {
             let key = pack_xy(row[0], row[1]);
-            if let Some(count) = m.get_mut(&key) {
-                if *count > 1 { *count -= 1; } else { m.remove(&key); }
-            }
+            m.dec(key);
         }
     }
 
@@ -644,7 +638,7 @@ impl GridObstacleMap {
     /// via cells into a rung of the working map (#530). Sorted, so two maps
     /// stamped identically export identically.
     pub fn blocked_via_cells_at_rung(&self, rung: usize) -> Vec<(i32, i32)> {
-        let src: Option<&FxHashMap<u64, u16>> = if rung == 0 {
+        let src: Option<&RefMap> = if rung == 0 {
             Some(&self.blocked_vias)
         } else {
             self.blocked_vias_rungs.get(rung - 1)
@@ -652,7 +646,7 @@ impl GridObstacleMap {
         let mut rows: Vec<(i32, i32)> = Vec::new();
         if let Some(m) = src {
             rows.reserve(m.len());
-            for &k in m.keys() {
+            for k in m.keys() {
                 rows.push(unpack_xy(k));
             }
         }
@@ -693,9 +687,8 @@ impl GridObstacleMap {
             let layer = row[2] as usize;
             if layer < self.num_layers {
                 let key = pack_xy(gx, gy);
-                let cnt = self.blocked_cells[layer].entry(key).or_insert(0);
-                *cnt += 1;
-                if *cnt == 1 {
+                let cnt = self.blocked_cells[layer].inc(key);
+                if cnt == 1 {
                     self.blocked_bitmap.set(gx, gy, layer); // S2: 0->1 transition
                 }
             }
@@ -726,9 +719,8 @@ impl GridObstacleMap {
             }
             for gy in lo..=hi {
                 let key = pack_xy(gx, gy);
-                let cnt = self.blocked_cells[layer].entry(key).or_insert(0);
-                *cnt += 1;
-                if *cnt == 1 {
+                let cnt = self.blocked_cells[layer].inc(key);
+                if cnt == 1 {
                     self.blocked_bitmap.set(gx, gy, layer); // S2: 0->1 transition
                 }
             }
@@ -747,7 +739,7 @@ impl GridObstacleMap {
             }
             for gy in lo..=hi {
                 let key = pack_xy(gx, gy);
-                *self.blocked_vias.entry(key).or_insert(0) += 1;
+                self.blocked_vias.inc(key);
             }
         }
     }
@@ -776,7 +768,7 @@ impl GridObstacleMap {
             let gx = row[0];
             let gy = row[1];
             let key = pack_xy(gx, gy);
-            *self.blocked_vias.entry(key).or_insert(0) += 1;
+            self.blocked_vias.inc(key);
         }
     }
 
@@ -857,19 +849,17 @@ impl GridObstacleMap {
     pub fn merge_blocked_from(&mut self, other: &GridObstacleMap) {
         for (layer, other_cells) in other.blocked_cells.iter().enumerate() {
             if layer < self.num_layers {
-                for (&key, &count) in other_cells.iter() {
-                    let cnt = self.blocked_cells[layer].entry(key).or_insert(0);
-                    let was_zero = *cnt == 0;
-                    *cnt += count;
-                    if was_zero && *cnt > 0 {
+                for (key, count) in other_cells.iter() {
+                    let (old, new) = self.blocked_cells[layer].add(key, count);
+                    if old == 0 && new > 0 {
                         let (gx, gy) = unpack_xy(key);
                         self.blocked_bitmap.set(gx, gy, layer); // S2: 0->1 transition
                     }
                 }
             }
         }
-        for (&key, &count) in other.blocked_vias.iter() {
-            *self.blocked_vias.entry(key).or_insert(0) += count;
+        for (key, count) in other.blocked_vias.iter() {
+            self.blocked_vias.add(key, count);
         }
     }
 
@@ -882,13 +872,8 @@ impl GridObstacleMap {
             let layer = row[2] as usize;
             if layer < self.num_layers {
                 let key = pack_xy(gx, gy);
-                if let Some(count) = self.blocked_cells[layer].get_mut(&key) {
-                    if *count > 1 {
-                        *count -= 1;
-                    } else {
-                        self.blocked_cells[layer].remove(&key);
+                if self.blocked_cells[layer].dec(key) == Some(0) {
                         self.blocked_bitmap.clear(gx, gy, layer); // S2: 1->0 transition
-                    }
                 }
             }
         }
@@ -901,13 +886,7 @@ impl GridObstacleMap {
             let gx = row[0];
             let gy = row[1];
             let key = pack_xy(gx, gy);
-            if let Some(count) = self.blocked_vias.get_mut(&key) {
-                if *count > 1 {
-                    *count -= 1;
-                } else {
-                    self.blocked_vias.remove(&key);
-                }
-            }
+            self.blocked_vias.dec(key);
         }
     }
 
@@ -933,13 +912,8 @@ impl GridObstacleMap {
             }
             for gy in lo..=hi {
                 let key = pack_xy(gx, gy);
-                if let Some(count) = self.blocked_cells[layer].get_mut(&key) {
-                    if *count > 1 {
-                        *count -= 1;
-                    } else {
-                        self.blocked_cells[layer].remove(&key);
+                if self.blocked_cells[layer].dec(key) == Some(0) {
                         self.blocked_bitmap.clear(gx, gy, layer); // S2: 1->0 transition
-                    }
                 }
             }
         }
@@ -957,13 +931,7 @@ impl GridObstacleMap {
             }
             for gy in lo..=hi {
                 let key = pack_xy(gx, gy);
-                if let Some(count) = self.blocked_vias.get_mut(&key) {
-                    if *count > 1 {
-                        *count -= 1;
-                    } else {
-                        self.blocked_vias.remove(&key);
-                    }
-                }
+                self.blocked_vias.dec(key);
             }
         }
     }
@@ -1505,11 +1473,11 @@ impl GridObstacleMap {
 // #[pymethods] block: pyo3 wraps every method in that block for Python, and a
 // method returning `&mut FxHashMap` cannot be wrapped.
 impl GridObstacleMap {
-    fn rung_map_mut(&mut self, rung: usize) -> &mut FxHashMap<u64, u16> {
+    fn rung_map_mut(&mut self, rung: usize) -> &mut RefMap {
         // rung 0 is blocked_vias; callers route rung 0 there explicitly
         let idx = rung - 1;
         while self.blocked_vias_rungs.len() <= idx {
-            self.blocked_vias_rungs.push(FxHashMap::default());
+            self.blocked_vias_rungs.push(RefMap::default());
         }
         &mut self.blocked_vias_rungs[idx]
     }
