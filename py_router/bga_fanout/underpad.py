@@ -71,6 +71,56 @@ def _pad_extent(pad):
 _STEPS = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)]
 
 
+class _CellMask:
+    """A set of (ix, iy) grid cells stored as one byte per cell (ix*ny + iy,
+    the _Occ.grid layout), filled by whole column spans.
+
+    _carve_foreign's foreign-stamp sets: as Python sets of tuples they cost
+    ~280M tuple builds on one rescue-heavy route. Consumers only ever test
+    membership (always after `c in home`), so a mask that may also hold
+    stamp cells OUTSIDE home answers every such test identically. The buffer
+    is allocated on first use."""
+    __slots__ = ('nx', 'ny', 'ones', 'buf')
+
+    def __init__(self, nx, ny, ones):
+        self.nx, self.ny, self.ones = nx, ny, ones
+        self.buf = None
+
+    def add_spans(self, spans):
+        if not spans:
+            return
+        buf = self.buf
+        if buf is None:
+            buf = self.buf = bytearray(self.nx * self.ny)
+        ny, ones = self.ny, self.ones
+        for a, b0, b1 in spans:
+            i = a * ny + b0
+            buf[i:i + b1 - b0 + 1] = ones[:b1 - b0 + 1]
+
+    def __bool__(self):
+        return self.buf is not None
+
+    def __contains__(self, c):
+        buf = self.buf
+        if buf is None:
+            return False
+        a, b = c
+        return 0 <= a < self.nx and 0 <= b < self.ny and buf[a * self.ny + b] == 1
+
+
+class _HomeExempt:
+    """`home - c_all - c_lay` as a membership-only view (see _CellMask)."""
+    __slots__ = ('home', 'c_all', 'c_lay')
+
+    def __init__(self, home, c_all, c_lay):
+        self.home, self.c_all, self.c_lay = home, c_all, c_lay
+
+    def __contains__(self, c):
+        if c not in self.home or c in self.c_all:
+            return False
+        return self.c_lay is None or c not in self.c_lay
+
+
 class _Occ:
     """Layered occupancy grid over the BGA escape region.
 
@@ -102,6 +152,7 @@ class _Occ:
         # length per span); ny is the longest span any column can need.
         self._ones = b'\x01' * self.ny
         self._disk_memo = {}       # #864: see disk_cells
+        self._span_memo = {}       # see disk_spans
 
     def cell(self, x, y):
         return (int((x - self.x0) / self.res), int((y - self.y0) / self.res))
@@ -196,6 +247,22 @@ class _Occ:
                 self._disk_memo.clear()
             self._disk_memo[key] = cells
         return cells
+
+    def disk_spans(self, x, y, r):
+        """_disk_spans, memoised per (x, y, r) like disk_cells -- the same
+        cells disk_cells(x, y, r) holds, as column spans."""
+        key = (round(x, 6), round(y, 6), round(r, 6))
+        spans = self._span_memo.get(key)
+        if spans is None:
+            spans = self._disk_spans(x, y, r)
+            if len(self._span_memo) >= 200000:
+                self._span_memo.clear()
+            self._span_memo[key] = spans
+        return spans
+
+    def new_mask(self):
+        """An empty _CellMask over this grid."""
+        return _CellMask(self.nx, self.ny, self._ones)
 
     def block_layer(self, li, x, y, r):
         g = self.grid[li]
@@ -1033,8 +1100,12 @@ def generate_underpad_escape(footprint: Footprint,
         listed stay blocked despite being in `home`. Same-net stamps are NOT
         carved (crossing own-net copper is not a DRC conflict), so an escape-
         priority extras pass can still exit over its net's pass-1 copper.
+
+        The cell sets are _CellMasks holding the WHOLE foreign stamps; every
+        consumer tests `c in home` first, so that answers exactly as the
+        home-intersected sets did, without enumerating a cell.
         """
-        c_all: set = set()
+        c_all = occ.new_mask()
         c_lay: dict = {}
         if not home:
             return c_all, c_lay
@@ -1043,24 +1114,24 @@ def generate_underpad_escape(footprint: Footprint,
             return any((x - ax) ** 2 + (y - ay) ** 2 < reach * reach
                        for ax, ay in anchors)
 
-        def add(cells, li):
-            cells &= home
-            if not cells:
-                return
+        def add(spans, li):
             if li is None:
-                c_all.update(cells)
+                c_all.add_spans(spans)
             else:
-                c_lay.setdefault(li, set()).update(cells)
+                m = c_lay.get(li)
+                if m is None:
+                    m = c_lay[li] = occ.new_mask()
+                m.add_spans(spans)
 
         for (x, y, keep, li, nid) in carve_disks:
             if nid in net_ids or not near_pt(x, y, home_r + keep):
                 continue
-            add(occ.disk_cells(x, y, keep) & home, li)
+            add(occ.disk_spans(x, y, keep), li)
         for v in vias_to_add:
             keep = v['size'] / 2.0 + track_width / 2 + clearance + margin
             if v['net_id'] in net_ids or not near_pt(v['x'], v['y'], home_r + keep):
                 continue
-            add(occ.disk_cells(v['x'], v['y'], keep) & home, None)
+            add(occ.disk_spans(v['x'], v['y'], keep), None)
 
         def add_seg(x1, y1, x2, y2, keep, li):
             # #864: the capsule around a foreign track, as disks sampled every
@@ -1069,7 +1140,7 @@ def generate_underpad_escape(footprint: Footprint,
             # sqrt(keep^2 + (step/2)^2) at that spacing covers the capsule of
             # radius keep with no gap (the far point midway between samples is
             # exactly that far), so the carve only ever over-blocks, by at most
-            # 3% of keep. Each disk is memoised and cut to `home` at once.
+            # 3% of keep. Each disk's spans are memoised.
             dx, dy = x2 - x1, y2 - y1
             slen = math.hypot(dx, dy)
             step = max(res, keep / 2.0)
@@ -1083,11 +1154,9 @@ def generate_underpad_escape(footprint: Footprint,
                 k0 = max(0, int((t - reach) * n))
                 k1 = min(n, int((t + reach) * n) + 1)
                 idxs.update(range(k0, k1 + 1))
-            cells = set()
             for i in idxs:
                 t = i / n
-                cells |= occ.disk_cells(x1 + dx * t, y1 + dy * t, r_eff) & home
-            add(cells, li)
+                add(occ.disk_spans(x1 + dx * t, y1 + dy * t, r_eff), li)
 
         def seg_near(x1, y1, x2, y2, reach):
             dx, dy = x2 - x1, y2 - y1
@@ -1117,13 +1186,16 @@ def generate_underpad_escape(footprint: Footprint,
         return c_all, c_lay
 
     def _eff_exempt(home, carve, li):
-        """The home exemption set effective on layer li (home minus carve)."""
+        """The home exemption effective on layer li (home minus carve), as a
+        membership-only view -- its consumers (seg_clear / seg_soft_hits)
+        only test `cell in exempt`."""
         if carve is None:
             return home
         c_all, c_lay = carve
-        if not c_all and not c_lay:
+        lay = c_lay.get(li)
+        if not c_all and not lay:
             return home
-        return home - c_all - c_lay.get(li, _EMPTY)
+        return _HomeExempt(home, c_all, lay)
 
     def _via_ctx(net_id, cx, cy, extra=0.0):
         """Gather the geometry near (cx, cy) that an off-centre via must clear
