@@ -35,7 +35,8 @@ impl RefMap {
         let dx = gx.wrapping_sub(self.min_x);
         let dy = gy.wrapping_sub(self.min_y);
         if (dx as u32) < self.width as u32 && (dy as u32) < self.height as u32 {
-            Some(dy as usize * self.width as usize + dx as usize)
+            // Column-major: a (gx, lo..hi) span is one contiguous run.
+            Some(dx as usize * self.height as usize + dy as usize)
         } else {
             None
         }
@@ -79,13 +80,13 @@ impl RefMap {
         let (nw, nh) = ((x1 - x0 + 1) as i32, (y1 - y0 + 1) as i32);
         let mut counts = vec![0u16; nw as usize * nh as usize];
         if self.width > 0 {
-            for dy in 0..self.height {
-                let src = dy as usize * self.width as usize;
-                let ny = (self.min_y as i64 + dy as i64 - y0) as usize;
-                let nx = (self.min_x as i64 - x0) as usize;
-                let dst = ny * nw as usize + nx;
-                counts[dst..dst + self.width as usize]
-                    .copy_from_slice(&self.counts[src..src + self.width as usize]);
+            for dx in 0..self.width {
+                let src = dx as usize * self.height as usize;
+                let nx = (self.min_x as i64 + dx as i64 - x0) as usize;
+                let ny = (self.min_y as i64 - y0) as usize;
+                let dst = nx * nh as usize + ny;
+                counts[dst..dst + self.height as usize]
+                    .copy_from_slice(&self.counts[src..src + self.height as usize]);
             }
         }
         self.min_x = x0 as i32;
@@ -140,6 +141,40 @@ impl RefMap {
                 (old, *c)
             }
         }
+    }
+
+    /// Increment every cell of the column span gx, lo..=hi, calling
+    /// on_new(gy) for each cell whose count went 0 -> nonzero -- exactly what
+    /// inc() per cell would report, but with one window check per span and a
+    /// contiguous inner loop.
+    #[inline]
+    pub fn add_span<F: FnMut(i32)>(&mut self, gx: i32, lo: i32, hi: i32, mut on_new: F) {
+        if hi < lo {
+            return;
+        }
+        if self.idx(gx, lo).is_none() { self.grow_to_include(gx, lo); }
+        if self.idx(gx, hi).is_none() { self.grow_to_include(gx, hi); }
+        let (Some(a), Some(b)) = (self.idx(gx, lo), self.idx(gx, hi)) else {
+            // Window capped: per cell (some cells go to the overflow map).
+            for gy in lo..=hi {
+                let (old, new) = self.add(pack_xy(gx, gy), 1);
+                if old == 0 && new != 0 { on_new(gy); }
+            }
+            return;
+        };
+        let mut nnz = self.nnz;
+        for (k, c) in self.counts[a..=b].iter_mut().enumerate() {
+            let old = *c;
+            let new = old.wrapping_add(1);
+            *c = new;
+            if old == 0 {
+                nnz += 1;
+                on_new(lo + k as i32);
+            } else if new == 0 {
+                nnz -= 1;
+            }
+        }
+        self.nnz = nnz;
     }
 
     /// Increment; returns the new count.
@@ -217,11 +252,11 @@ impl RefMap {
     /// (key, count) for every present cell; order is unspecified (as the hash
     /// map's was).
     pub fn iter(&self) -> impl Iterator<Item = (u64, u16)> + '_ {
-        let w = self.width.max(0) as usize;
+        let h = self.height.max(1) as usize;
         let (x0, y0) = (self.min_x, self.min_y);
         self.counts.iter().enumerate()
             .filter(|(_, &c)| c != 0)
-            .map(move |(i, &c)| (pack_xy(x0 + (i % w) as i32, y0 + (i / w) as i32), c))
+            .map(move |(i, &c)| (pack_xy(x0 + (i / h) as i32, y0 + (i % h) as i32), c))
             .chain(self.overflow.iter().map(|(&k, &c)| (k, c)))
     }
 
@@ -237,6 +272,31 @@ impl RefMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_span_matches_inc() {
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        let mut a = RefMap::default();
+        let mut b = RefMap::default();
+        for step in 0..60_000u32 {
+            let r = rnd();
+            let gx = if r % 211 == 0 { ((r >> 9) as i32) % 1_000_000_000 }
+                     else { (r % 2000) as i32 - 1000 + (step as i32 / 500) };
+            let lo = ((r >> 20) % 1500) as i32 - 750;
+            let hi = lo + ((r >> 40) % 60) as i32 - 3;          // includes empty spans
+            let mut ta = Vec::new();
+            a.add_span(gx, lo, hi, |gy| ta.push(gy));
+            let mut tb = Vec::new();
+            if hi >= lo { for gy in lo..=hi { if b.inc(pack_xy(gx, gy)) == 1 { tb.push(gy); } } }
+            assert_eq!(ta, tb);
+            if r % 7 == 0 { let k = pack_xy(gx, lo); assert_eq!(a.dec(k), b.dec(k)); }
+        }
+        assert_eq!(a.len(), b.len());
+        let mut x: Vec<(u64, u16)> = a.iter().collect(); x.sort();
+        let mut y: Vec<(u64, u16)> = b.iter().collect(); y.sort();
+        assert_eq!(x, y);
+    }
 
     #[test]
     fn matches_hashmap() {

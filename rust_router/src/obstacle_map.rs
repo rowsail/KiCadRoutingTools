@@ -58,9 +58,35 @@ impl BlockedBitmap {
         let dx = gx.wrapping_sub(self.min_x);
         let dy = gy.wrapping_sub(self.min_y);
         if (dx as u32) < self.width as u32 && (dy as u32) < self.height as u32 {
-            Some(dy as usize * self.width as usize + dx as usize)
+            // Column-major (x outer): the stamping API is column SPANS
+            // (gx, y_lo..y_hi), so a span is one contiguous run of bits.
+            Some(dx as usize * self.height as usize + dy as usize)
         } else {
             None
+        }
+    }
+
+    /// Set every cell of the column span gx, lo..=hi (static stamps): whole
+    /// 64-bit words where the run covers them. Same result as set() per cell.
+    fn set_span(&mut self, gx: i32, lo: i32, hi: i32, layer: usize) {
+        if hi < lo {
+            return;
+        }
+        if self.idx(gx, lo).is_none() { self.grow_to_include(gx, lo); }
+        if self.idx(gx, hi).is_none() { self.grow_to_include(gx, hi); }
+        let (Some(a), Some(b)) = (self.idx(gx, lo), self.idx(gx, hi)) else {
+            for gy in lo..=hi { self.set(gx, gy, layer); }   // capped window
+            return;
+        };
+        let base = layer * self.words_per_layer;
+        let (mut i, end) = (a, b + 1);
+        while i < end {
+            let w = i >> 6;
+            let off = i & 63;
+            let n = (64 - off).min(end - i);
+            let mask = if n == 64 { !0u64 } else { ((1u64 << n) - 1) << off };
+            self.bits[base + w] |= mask;
+            i += n;
         }
     }
 
@@ -120,20 +146,38 @@ impl BlockedBitmap {
     /// would otherwise be invisible to the in-window test path). Refuses to
     /// grow past BITMAP_MAX_CELLS; the caller then falls back to overflow.
     fn grow_to_include(&mut self, gx: i32, gy: i32) {
-        let (new_min_x, new_min_y, new_max_x, new_max_y) = if self.width == 0 {
-            (gx - BITMAP_GROW_MARGIN, gy - BITMAP_GROW_MARGIN,
-             gx + BITMAP_GROW_MARGIN, gy + BITMAP_GROW_MARGIN)
+        // Window bounds as i64. Grow the side(s) that need it by at least
+        // the current extent (geometric, so a map filling cell by cell
+        // remaps O(log n) times, not once per BITMAP_GROW_MARGIN); if that
+        // would pass the cap, fall back to the plain margin as before.
+        let m = BITMAP_GROW_MARGIN as i64;
+        let (gx64, gy64) = (gx as i64, gy as i64);
+        let margin_bounds = if self.width == 0 {
+            (gx64 - m, gy64 - m, gx64 + m, gy64 + m)
         } else {
-            (self.min_x.min(gx - BITMAP_GROW_MARGIN),
-             self.min_y.min(gy - BITMAP_GROW_MARGIN),
-             (self.min_x + self.width - 1).max(gx + BITMAP_GROW_MARGIN),
-             (self.min_y + self.height - 1).max(gy + BITMAP_GROW_MARGIN))
+            let (x0, y0) = (self.min_x as i64, self.min_y as i64);
+            let (x1, y1) = (x0 + self.width as i64 - 1, y0 + self.height as i64 - 1);
+            (x0.min(gx64 - m), y0.min(gy64 - m), x1.max(gx64 + m), y1.max(gy64 + m))
         };
-        let new_w = (new_max_x as i64 - new_min_x as i64 + 1) as i64;
-        let new_h = (new_max_y as i64 - new_min_y as i64 + 1) as i64;
-        if new_w * new_h > BITMAP_MAX_CELLS {
-            return; // caller falls back to the overflow set
-        }
+        let geometric = if self.width == 0 { margin_bounds } else {
+            let (x0, y0) = (self.min_x as i64, self.min_y as i64);
+            let (w, h) = (self.width as i64, self.height as i64);
+            let (x1, y1) = (x0 + w - 1, y0 + h - 1);
+            (if gx64 < x0 { (gx64 - m).min(x0 - w) } else { x0 },
+             if gy64 < y0 { (gy64 - m).min(y0 - h) } else { y0 },
+             if gx64 > x1 { (gx64 + m).max(x1 + w) } else { x1 },
+             if gy64 > y1 { (gy64 + m).max(y1 + h) } else { y1 })
+        };
+        let area = |b: (i64, i64, i64, i64)| (b.2 - b.0 + 1) * (b.3 - b.1 + 1);
+        let fits = |b: (i64, i64, i64, i64)| area(b) <= BITMAP_MAX_CELLS
+            && b.0 >= i32::MIN as i64 && b.2 <= i32::MAX as i64
+            && b.1 >= i32::MIN as i64 && b.3 <= i32::MAX as i64;
+        let b = if fits(geometric) { geometric }
+                else if fits(margin_bounds) { margin_bounds }
+                else { return; }; // caller falls back to the overflow set
+        let (new_min_x, new_min_y) = (b.0 as i32, b.1 as i32);
+        let new_w = b.2 - b.0 + 1;
+        let new_h = b.3 - b.1 + 1;
         let new_w = new_w as i32;
         let new_h = new_h as i32;
         let new_words = ((new_w as usize * new_h as usize) + 63) / 64;
@@ -145,15 +189,18 @@ impl BlockedBitmap {
             for layer in 0..self.num_layers {
                 let old_base = layer * self.words_per_layer;
                 let new_base = layer * new_words;
-                for dy in 0..self.height {
-                    let ny = (self.min_y + dy) - new_min_y;
-                    for dx in 0..self.width {
-                        let i = dy as usize * self.width as usize + dx as usize;
-                        if (self.bits[old_base + (i >> 6)] >> (i & 63)) & 1 != 0 {
-                            let nx = (self.min_x + dx) - new_min_x;
-                            let ni = ny as usize * new_w as usize + nx as usize;
-                            new_bits[new_base + (ni >> 6)] |= 1u64 << (ni & 63);
-                        }
+                // Walk only the SET bits, a word at a time.
+                let old_h = self.height as usize;
+                for wi in 0..self.words_per_layer {
+                    let mut w = self.bits[old_base + wi];
+                    while w != 0 {
+                        let i = wi * 64 + w.trailing_zeros() as usize;
+                        w &= w - 1;
+                        let (dx, dy) = ((i / old_h) as i32, (i % old_h) as i32);
+                        let nx = (self.min_x + dx) - new_min_x;
+                        let ny = (self.min_y + dy) - new_min_y;
+                        let ni = nx as usize * new_h as usize + ny as usize;
+                        new_bits[new_base + (ni >> 6)] |= 1u64 << (ni & 63);
                     }
                 }
             }
@@ -717,13 +764,12 @@ impl GridObstacleMap {
             if layer >= self.num_layers || hi < lo {
                 continue;
             }
-            for gy in lo..=hi {
-                let key = pack_xy(gx, gy);
-                let cnt = self.blocked_cells[layer].inc(key);
-                if cnt == 1 {
-                    self.blocked_bitmap.set(gx, gy, layer); // S2: 0->1 transition
-                }
-            }
+            // One contiguous run per span; the bitmap is set exactly at the
+            // 0->1 transitions, as the per-cell loop did.
+            let bitmap = &mut self.blocked_bitmap;
+            self.blocked_cells[layer].add_span(gx, lo, hi, |gy| {
+                bitmap.set(gx, gy, layer); // S2: 0->1 transition
+            });
         }
     }
 
@@ -737,10 +783,7 @@ impl GridObstacleMap {
             if hi < lo {
                 continue;
             }
-            for gy in lo..=hi {
-                let key = pack_xy(gx, gy);
-                self.blocked_vias.inc(key);
-            }
+            self.blocked_vias.add_span(gx, lo, hi, |_| {});
         }
     }
 
@@ -755,9 +798,7 @@ impl GridObstacleMap {
             if layer >= self.num_layers || hi < lo {
                 continue;
             }
-            for gy in lo..=hi {
-                self.static_blocked_bitmap.set(gx, gy, layer);
-            }
+            self.static_blocked_bitmap.set_span(gx, lo, hi, layer);
         }
     }
 
@@ -1480,5 +1521,36 @@ impl GridObstacleMap {
             self.blocked_vias_rungs.push(RefMap::default());
         }
         &mut self.blocked_vias_rungs[idx]
+    }
+}
+
+#[cfg(test)]
+mod bitmap_tests {
+    use super::*;
+
+    #[test]
+    fn set_span_matches_set() {
+        let mut seed: u64 = 0xD1B54A32D192ED03;
+        let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        let mut a = BlockedBitmap::new(2);
+        let mut b = BlockedBitmap::new(2);
+        for _ in 0..20_000 {
+            let r = rnd();
+            let gx = (r % 900) as i32 - 450;
+            let lo = ((r >> 16) % 900) as i32 - 450;
+            let hi = lo + ((r >> 32) % 140) as i32 - 2;
+            let layer = ((r >> 50) & 1) as usize;
+            a.set_span(gx, lo, hi, layer);
+            if hi >= lo { for gy in lo..=hi { b.set(gx, gy, layer); } }
+            if r % 5 == 0 { a.clear(gx, lo, layer); b.clear(gx, lo, layer); }
+        }
+        for layer in 0..2 {
+            for gx in -470..470 {
+                for gy in -470..620 {
+                    assert_eq!(a.test(gx, gy, layer), b.test(gx, gy, layer), "{gx},{gy},{layer}");
+                }
+            }
+        }
+        assert_eq!(a.population(), b.population());
     }
 }
