@@ -554,6 +554,30 @@ def build_base_obstacle_map(pcb_data: PCBData, config: GridRouteConfig,
         finally:
             for _k, _v in _build_records.items():
                 setattr(pcb_data, _k, _v)
+        # #568 small rung on a NON-static map. The loop above skips rung 1
+        # because the main route freezes its base into the static bitmap,
+        # which every rung consults. A map built with static_base=False (the
+        # rescue / terminal-escalation pristine maps, fanout and probe maps)
+        # keeps its base copper -- every pad and every other net's track -- in
+        # the dynamic rung-0 via map only. is_via_blocked_rung(.., 1) reads
+        # rung 1 + static once rung 1 is non-empty, so as soon as anything
+        # populated rung 1 (the rescued net's own guards do), a small-via
+        # search on such a map saw NO base copper: rung vias landed on
+        # foreign pads and tracks (EssentialsV2: a 0.45/0.2 /GPIO/PD8 via on
+        # U1 pad 8, U15 pad 27 and a /GPIO/PD6 track; KiCad DRC: shorts).
+        # Mirror the base's full-size via cells into rung 1 -- exactly the
+        # conservative over-block the static freeze gives the main map.
+        if not static_base:
+            try:
+                from obstacle_cache import _small_via_pair as _svp
+                if _svp(config, pcb_data) is not None:
+                    _base_cells = _real_obstacles.blocked_via_cells_at_rung(0)
+                    if _base_cells:
+                        _real_obstacles.add_blocked_vias_rung_batch(
+                            1, np.asarray(_base_cells, dtype=np.int32))
+            except Exception as _e568:                        # noqa: BLE001
+                print(f"  WARNING: small-rung base mirror failed ({_e568}); "
+                      f"small-via search may ignore base copper on this map")
     return _real_obstacles
 
 
