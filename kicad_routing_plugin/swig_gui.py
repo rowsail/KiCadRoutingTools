@@ -60,10 +60,23 @@ from .gui_utils import StdoutRedirector, board_minima_from_live
 from .settings_persistence import get_dialog_settings, restore_dialog_settings
 
 
+def _import_grid_router():
+    """grid_router as the router itself loads it: rust_alloc first (#419:
+    allocator env before the library loads), with rust_router/ on sys.path --
+    at dialog-build time no routing module has put it there yet, so a bare
+    import failed and both GPU options were greyed out in KiCad."""
+    import rust_alloc  # noqa: F401
+    _rr = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'rust_router'))
+    if _rr not in sys.path:
+        sys.path.insert(0, _rr)
+    import grid_router
+    return grid_router
+
+
 def _gpu_plan_status():
     """(usable, tooltip line) for the GPU global plan option."""
     try:
-        import grid_router
+        grid_router = _import_grid_router()
         if not hasattr(grid_router, 'GpuGlobalRouter'):
             return False, ("Unavailable: the installed grid_router library was "
                            "built without GPU support (cargo feature 'gpu').")
@@ -72,6 +85,14 @@ def _gpu_plan_status():
         return True, "A CUDA GPU is available."
     except Exception as e:
         return False, f"Unavailable: {e}"
+
+
+def _gpu_search_supported():
+    try:
+        grid_router = _import_grid_router()
+        return hasattr(grid_router.GridRouter, 'route_with_frontier_gpu')
+    except Exception:
+        return False
 
 
 def _build_layer_mappings():
@@ -1587,6 +1608,25 @@ class RoutingDialog(wx.Dialog):
         if not _gpu_ok:
             self.gpu_plan_check.Enable(False)
         options_inner.Add(self.gpu_plan_check, 0, wx.ALL, 3)
+        self.gpu_search_check = wx.CheckBox(
+            options_scroll, label="GPU wavefront search")
+        _gs_ok = _gpu_ok and _gpu_search_supported()
+        self.gpu_search_check.SetValue(_gs_ok)   # ON by default when usable
+        self.gpu_search_check.SetToolTip(
+            "When a net's quick CPU search probes fail, flood the board on the GPU "
+            "(Lee's algorithm): either prove that no path exists -- skipping the long "
+            "CPU search -- or hand the CPU search an exact distance-to-target map so "
+            "it goes straight to the target. The CPU still makes every routing "
+            "decision, so legality is unchanged. Measured on two 6-layer boards: "
+            "~20% faster and more nets routed; on a small 4-layer board it was slower "
+            "and slightly worse -- untick to compare. ON by default when a GPU is "
+            "usable. Matches the CLI's --no-gpu-search.\n\n"
+            + _gpu_why
+            + ("" if _gs_ok or not _gpu_ok else
+               "\nUnavailable: the installed grid_router has no GPU search."))
+        if not _gs_ok:
+            self.gpu_search_check.Enable(False)
+        options_inner.Add(self.gpu_search_check, 0, wx.ALL, 3)
 
         options_inner.AddSpacer(10)
 
@@ -1990,6 +2030,7 @@ class RoutingDialog(wx.Dialog):
                 'same_net_pad_clearance': self._same_net_pad_clearance_value(),
                 'relax_drc_severities': self.relax_drc_severities_check.GetValue(),
                 'gpu_plan': self.gpu_plan_check.GetValue(),
+                'gpu_search': self.gpu_search_check.GetValue(),
                 'clamp_netclasses': self._ceiling_on(),
                 'fab_tier': self.fab_tier.GetString(self.fab_tier.GetSelection()),
                 'fab_overrides_path': self.fab_overrides_path.GetValue().strip(),
@@ -2753,6 +2794,7 @@ class RoutingDialog(wx.Dialog):
         # #856: severity relaxation is opt-in per step (CLI --relax-drc-severities off).
         self.relax_drc_severities_check.SetValue(False)
         self.gpu_plan_check.SetValue(False)
+        self.gpu_search_check.SetValue(self.gpu_search_check.IsEnabled())
         # #857/#530: the CLI defaults, from the one place they live.
         self.fab_tier.SetStringSelection(defaults.FAB_TIER)
         self.escalation.SetStringSelection(defaults.ESCALATION)
@@ -3142,6 +3184,7 @@ class RoutingDialog(wx.Dialog):
             'fix_drc_settings': self.fix_drc_check.GetValue(),
             'relax_drc_severities': self.relax_drc_severities_check.GetValue(),
             'gpu_plan': self.gpu_plan_check.GetValue(),
+            'gpu_search': self.gpu_search_check.GetValue(),
             'clamp_netclasses': self._ceiling_on(),
             # Guide corridor (issue #7)
             'guide_corridor_enabled': self.guide_corridor_check.GetValue(),
@@ -3627,11 +3670,14 @@ class RoutingDialog(wx.Dialog):
             def run_batch(*a, **kw):
                 # GPU global plan option: on only for this routing run.
                 from gpu_plan import request_gpu_plan
+                from single_ended_routing import request_gpu_search
                 request_gpu_plan(bool(config.get('gpu_plan')))
+                request_gpu_search('on' if config.get('gpu_search') else 'off')
                 try:
                     return _run_batch(*a, **kw)
                 finally:
                     request_gpu_plan(False)
+                    request_gpu_search(None)
 
             def _run_batch(net_names, track_width, clearance, via_size, via_drill):
                 """Run batch_route with given parameters."""

@@ -52,6 +52,7 @@ def get_dialog_settings(dialog):
         'fix_drc_settings': dialog.fix_drc_check.GetValue(),
         'relax_drc_severities': dialog.relax_drc_severities_check.GetValue(),
         'gpu_plan': dialog.gpu_plan_check.GetValue(),
+        'gpu_search': dialog.gpu_search_check.GetValue(),
         'power_nets': dialog.power_nets_ctrl.GetValue(),
         'power_widths': dialog.power_widths_ctrl.GetValue(),
         'no_bga_zones': dialog.no_bga_zones_ctrl.GetValue(),
@@ -354,6 +355,8 @@ def restore_dialog_settings(dialog, settings):
         dialog.relax_drc_severities_check.SetValue(settings['relax_drc_severities'])
     if 'gpu_plan' in settings and dialog.gpu_plan_check.IsEnabled():
         dialog.gpu_plan_check.SetValue(bool(settings['gpu_plan']))
+    if 'gpu_search' in settings and dialog.gpu_search_check.IsEnabled():
+        dialog.gpu_search_check.SetValue(bool(settings['gpu_search']))
     if 'power_nets' in settings:
         dialog.power_nets_ctrl.SetValue(settings['power_nets'])
     if 'power_widths' in settings:

@@ -16,6 +16,8 @@ mod refmap;
 mod raster;
 #[cfg(feature = "gpu")]
 mod gpu;
+#[cfg(feature = "gpu")]
+mod lee;
 mod obstacle_map;
 mod router;
 mod dubins;
@@ -150,6 +152,8 @@ fn gpu_available() -> bool {
 
 #[pymodule]
 fn grid_router(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    #[cfg(feature = "gpu")]
+    lee::note_load_pid();
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<GridObstacleMap>()?;
     m.add_class::<GridRouter>()?;

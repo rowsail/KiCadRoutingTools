@@ -1579,6 +1579,71 @@ def _probe_route_with_frontier(
     return result
 
 
+# ---- GPU wavefront search (hybrid; route_with_frontier_gpu) -----------------
+# Replaces the expensive FULL search (after both 5,000-step probes ran out of
+# budget) with a GPU flood of the cost-to-go from the targets: a proven "no
+# path" skips the CPU search entirely, otherwise the CPU A* runs guided by the
+# flood (every legality / cost decision stays the CPU's). Modes: 'on'
+# (DEFAULT -- inert without a usable GPU: the Rust side answers 'cpu' and the
+# normal search runs), 'off', 'prove' (diagnostic: take only the "no path"
+# proofs; boards identical to 'off'), 'shadow' (validation: run the GPU
+# alongside the unchanged CPU search, compare, change nothing). Set by
+# KICAD_GPU_SEARCH, the routing dialog's "GPU wavefront search" option, or
+# route.py --no-gpu-search.
+_GPU_SEARCH_REQ = None
+_GPU_SEARCH_STATS = {'calls': 0, 'unreachable': 0, 'reachable': 0, 'path': 0, 'fail': 0, 'cpu': 0,
+                     'gpu_ms': 0.0, 'cpu_full_ms': 0.0, 'cpu_full_found': 0,
+                     'violations': 0}
+
+
+def request_gpu_search(mode) -> None:
+    """'on' / 'off' / 'shadow' for this process (None = use the env knob)."""
+    global _GPU_SEARCH_REQ
+    _GPU_SEARCH_REQ = mode
+
+
+def _gpu_search_mode() -> str:
+    m = _GPU_SEARCH_REQ if _GPU_SEARCH_REQ is not None else \
+        os.environ.get('KICAD_GPU_SEARCH', 'on')
+    m = str(m).strip().lower()
+    return m if m in ('on', 'prove', 'shadow') else 'off'
+
+
+def gpu_search_stats() -> dict:
+    return dict(_GPU_SEARCH_STATS)
+
+
+def _gpu_full_search(router, obstacles, sources, targets, max_iters, dyn_kw,
+                     track_margin, ver, vrung, config, pcb_data, prove_only=False):
+    """One hybrid full search, or None when the GPU path is not available
+    (verdict 'cpu' -- the caller runs its CPU search)."""
+    fn = getattr(router, 'route_with_frontier_gpu', None)
+    if fn is None:
+        return None
+    clip = None
+    try:
+        bb = pcb_data.board_info.board_bounds if pcb_data is not None else None
+        if bb:
+            c = GridCoord(config.grid_step)
+            gx0, gy0 = c.to_grid(bb[0], bb[1])
+            gx1, gy1 = c.to_grid(bb[2], bb[3])
+            clip = (min(gx0, gx1) - 2, min(gy0, gy1) - 2, max(gx0, gx1) + 2, max(gy0, gy1) + 2)
+    except Exception:
+        clip = None
+    r = fn(obstacles, list(sources), list(targets), max_iters, clip=clip,
+           margin=max(200, int(round(20.0 / config.grid_step)) if config.grid_step >= 0.1 else 200),
+           track_margin=track_margin, via_exclusion_radius=ver, via_rung=vrung,
+           collinear_vias=env_knobs.COLLINEAR_VIAS,
+           max_cells=int(os.environ.get('KICAD_GPU_SEARCH_MAX_CELLS', '24000000')),
+           prove_only=prove_only, **dyn_kw)
+    _GPU_SEARCH_STATS['calls'] += 1
+    _GPU_SEARCH_STATS[r[4]] = _GPU_SEARCH_STATS.get(r[4], 0) + 1
+    _GPU_SEARCH_STATS['gpu_ms'] += r[5]
+    if r[4] == 'cpu':
+        return None
+    return r
+
+
 def _probe_route_with_frontier_once(
     router: 'GridRouter',
     obstacles: 'GridObstacleMap',
@@ -1737,12 +1802,69 @@ def _probe_route_with_frontier_once(
     _diag(f"{print_prefix}Probe: {first_label}={first_probe_iters}, {second_label}={second_probe_iters} iters, trying {first_label} with full iterations...")
 
     _dyn_base, _dyn_kw = _dynamic_iterations(config)
-    path, full_iters, full_blocked = router.route_with_frontier(
-        obstacles, forward_sources, forward_targets, _dyn_base, track_margin=track_margin, via_exclusion_radius=_ver, via_rung=_vrung,
-        collinear_vias=env_knobs.COLLINEAR_VIAS, **_dyn_kw)
-    _note_dynamic_extension(full_iters, _dyn_base, print_prefix)
-    first_total_iters += full_iters
-    total_iterations += full_iters
+    _gmode = _gpu_search_mode()
+    _gres = None
+    if _gmode != 'off':
+        _gres = _gpu_full_search(router, obstacles, forward_sources, forward_targets,
+                                 _dyn_base, _dyn_kw, track_margin, _ver, _vrung,
+                                 config, pcb_data, prove_only=(_gmode != 'on'))
+    if _gmode == 'prove' and _gres is not None and _gres[4] == 'unreachable':
+        # prove-only: take ONLY the proof; any other verdict runs the
+        # unchanged CPU search below.
+        _diag(f"{print_prefix}GPU wavefront: no path exists (proved, {_gres[5]:.0f} ms) -- full search skipped")
+        forward_blocked, backward_blocked = _gres[2], _gres[3]
+        fwd_iters, bwd_iters = get_fwd_bwd_iters()
+        return None, total_iterations, forward_blocked, backward_blocked, False, fwd_iters, bwd_iters
+    if _gmode == 'on' and _gres is not None:
+        _gp, _git, _gfb, _gbb, _gv, _gms = _gres
+        first_total_iters += _git
+        total_iterations += _git
+        if _gv == 'path':
+            _diag(f"{print_prefix}GPU wavefront: guided search found a path in {_git} iterations ({_gms:.0f} ms GPU)")
+            forward_blocked = []
+            fwd_iters, bwd_iters = get_fwd_bwd_iters()
+            return _gp, total_iterations, forward_blocked, backward_blocked, False, fwd_iters, bwd_iters
+        if _gv == 'unreachable':
+            _diag(f"{print_prefix}GPU wavefront: no path exists (proved, {_gms:.0f} ms) -- full search skipped")
+            forward_blocked, backward_blocked = _gfb, _gbb
+            fwd_iters, bwd_iters = get_fwd_bwd_iters()
+            return None, total_iterations, forward_blocked, backward_blocked, False, fwd_iters, bwd_iters
+        # 'fail': the guided forward search ran out of budget; try the guided
+        # backward search (flood from the sources).
+        forward_blocked = _gfb
+        _gres2 = _gpu_full_search(router, obstacles, forward_targets, forward_sources,
+                                  _dyn_base, _dyn_kw, track_margin, _ver, _vrung,
+                                  config, pcb_data)
+        if _gres2 is not None:
+            _gp2, _git2, _gfb2, _gbb2, _gv2, _gms2 = _gres2
+            second_total_iters += _git2
+            total_iterations += _git2
+            fwd_iters, bwd_iters = get_fwd_bwd_iters()
+            if _gv2 == 'path':
+                _diag(f"{print_prefix}GPU wavefront: guided backward search found a path in {_git2} iterations")
+                return _gp2, total_iterations, forward_blocked, [], True, fwd_iters, bwd_iters
+            if _gv2 == 'unreachable':
+                return None, total_iterations, _gbb2 or forward_blocked, _gfb2, False, fwd_iters, bwd_iters
+            backward_blocked = _gfb2
+            return None, total_iterations, forward_blocked, backward_blocked, False, fwd_iters, bwd_iters
+        # no GPU for the backward leg: fall through to the CPU backward search
+        path, full_iters, full_blocked = None, 0, _gfb
+    else:
+        _t_cpu = time.perf_counter()
+        path, full_iters, full_blocked = router.route_with_frontier(
+            obstacles, forward_sources, forward_targets, _dyn_base, track_margin=track_margin, via_exclusion_radius=_ver, via_rung=_vrung,
+            collinear_vias=env_knobs.COLLINEAR_VIAS, **_dyn_kw)
+        if _gmode == 'shadow' and _gres is not None:
+            _GPU_SEARCH_STATS['cpu_full_ms'] += (time.perf_counter() - _t_cpu) * 1000.0
+            if path is not None:
+                _GPU_SEARCH_STATS['cpu_full_found'] += 1
+                if _gres[4] == 'unreachable':
+                    _GPU_SEARCH_STATS['violations'] += 1
+                    print(f"{print_prefix}GPU SHADOW VIOLATION: GPU proved no path, CPU found one "
+                          f"(net {current_net_id})")
+        _note_dynamic_extension(full_iters, _dyn_base, print_prefix)
+        first_total_iters += full_iters
+        total_iterations += full_iters
 
     if path is not None:
         forward_blocked = []
@@ -1753,9 +1875,18 @@ def _probe_route_with_frontier_once(
     _diag(f"{print_prefix}No route found after {full_iters} iterations ({first_label}), trying {second_label}...")
     forward_blocked = full_blocked
 
+    _t_cpu_b = time.perf_counter()
     path, backward_full_iters, backward_full_blocked = router.route_with_frontier(
         obstacles, forward_targets, forward_sources, _dyn_base, track_margin=track_margin, via_exclusion_radius=_ver, via_rung=_vrung,
         collinear_vias=env_knobs.COLLINEAR_VIAS, **_dyn_kw)
+    if _gmode == 'shadow' and _gres is not None:
+        _GPU_SEARCH_STATS['cpu_full_ms'] += (time.perf_counter() - _t_cpu_b) * 1000.0
+        if path is not None:
+            _GPU_SEARCH_STATS['cpu_full_found'] += 1
+            if _gres[4] == 'unreachable':
+                _GPU_SEARCH_STATS['violations'] += 1
+                print(f"{print_prefix}GPU SHADOW VIOLATION: GPU proved no path, CPU found one "
+                      f"backward (net {current_net_id})")
     _note_dynamic_extension(backward_full_iters, _dyn_base, print_prefix)
     second_total_iters += backward_full_iters
     total_iterations += backward_full_iters
@@ -5765,3 +5896,13 @@ def _apply_neckdown_widths(segments, config: GridRouteConfig, net_id: int,
             pieces = head + pieces[1:]
         tapered.extend(pieces)
     return tapered
+
+
+if os.environ.get('KICAD_GPU_SEARCH', '').strip().lower() == 'shadow':
+    import atexit as _gs_atexit
+
+    @_gs_atexit.register
+    def _gpu_shadow_summary():
+        st = _GPU_SEARCH_STATS
+        if st['calls']:
+            print(f"GPU SHADOW SUMMARY: {st}")

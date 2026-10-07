@@ -3,6 +3,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=kernels/pathfinder.cu");
+    println!("cargo:rerun-if-changed=kernels/lee.cu");
     println!("cargo:rerun-if-changed=build.rs");
     if std::env::var_os("CARGO_FEATURE_GPU").is_none() {
         return;
@@ -18,4 +19,10 @@ fn main() {
         .status()
         .expect("failed to run nvcc (set NVCC=/path/to/nvcc)");
     assert!(status.success(), "nvcc failed");
+    let status = Command::new(&nvcc)
+        .args(["-ptx", "-O3", "-arch=compute_75", "kernels/lee.cu", "-o"])
+        .arg(format!("{out}/lee.ptx"))
+        .status()
+        .expect("failed to run nvcc (set NVCC=/path/to/nvcc)");
+    assert!(status.success(), "nvcc failed (lee.cu)");
 }

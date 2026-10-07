@@ -296,6 +296,47 @@ impl TrackMarginArg {
     }
 }
 
+/// GPU wavefront cost-to-go over a window (route_with_frontier_gpu): the
+/// cheapest permissive-legality path cost from each state to a target, or
+/// HT_INF. `contained`: the flood never escaped the window through an
+/// enterable border cell, so HT_INF provably means "cannot reach a target"
+/// and such states are pruned; otherwise HT_INF falls back to the octile
+/// heuristic.
+pub(crate) const HT_INF: u32 = u32::MAX;
+pub(crate) struct HTable {
+    pub x0: i32,
+    pub y0: i32,
+    pub w: i32,
+    pub h: i32,
+    pub l: i32,
+    pub contained: bool,
+    pub data: Vec<u32>,
+}
+impl HTable {
+    #[inline]
+    fn get(&self, gx: i32, gy: i32, layer: u8) -> Option<u32> {
+        let (x, y, l) = (gx - self.x0, gy - self.y0, layer as i32);
+        if x < 0 || y < 0 || x >= self.w || y >= self.h || l >= self.l { return None; }
+        Some(self.data[((l * self.h + y) * self.w + x) as usize])
+    }
+}
+
+/// Heuristic for a search state: the GPU table when present (None = prune),
+/// else the octile heuristic.
+#[inline(never)]
+fn search_h(router: &GridRouter, opts: &SearchOptions, s: &GridState,
+            targets: &[GridState], hint: &TargetHint) -> Option<i32> {
+    if let Some(t) = &opts.h_table {
+        if let Some(v) = t.get(s.gx, s.gy, s.layer) {
+            if v != HT_INF {
+                return Some(((v as f64) * router.h_weight as f64).min((i32::MAX / 4) as f64) as i32);
+            }
+            if t.contained { return None; }
+        }
+    }
+    Some(router.heuristic_to_targets(s, targets, hint))
+}
+
 /// Per-search options (route_multi's optional arguments, pre-normalized).
 pub(crate) struct SearchOptions {
     collinear_vias: bool,
@@ -308,6 +349,8 @@ pub(crate) struct SearchOptions {
     norm_end_dir: Option<(f64, f64)>,
     direction_steps: i32,
     track_margin: TrackMarginArg,
+    /// GPU wavefront heuristic (route_with_frontier_gpu); None = octile.
+    pub(crate) h_table: Option<std::sync::Arc<HTable>>,
 }
 
 impl SearchOptions {
@@ -335,6 +378,7 @@ impl SearchOptions {
             norm_end_dir,
             direction_steps,
             track_margin,
+            h_table: None,
         }
     }
 }
@@ -507,7 +551,10 @@ impl GridSearch {
             // Penalize starting on expensive layers
             let layer_cost = router.layer_cost_or_default(layer as usize);
             let initial_g = layer_cost - min_layer_cost;
-            let h = router.heuristic_to_targets(&state, &target_states, &target_hint);
+            let h = match search_h(router, &opts, &state, &target_states, &target_hint) {
+                Some(h) => h,
+                None => continue,   // GPU-proven dead source
+            };
             initial_h = initial_h.min(h);
             open_set.push(OpenEntry {
                 f_score: initial_g.saturating_add(h),
@@ -611,7 +658,7 @@ impl GridSearch {
     }
 
     /// Pop and process one open-set entry.
-    pub(crate) fn step<S: SearchSink>(
+    pub(crate) fn step<S: SearchSink, const GUIDED: bool>(
         &mut self,
         router: &GridRouter,
         obstacles: &GridObstacleMap,
@@ -843,6 +890,17 @@ impl GridSearch {
                 let new_g = g + step_cost;
 
                 if new_g < existing_g {
+                    // GPU wavefront table (route_with_frontier_gpu only); the
+                    // plain search takes the original path untouched.
+                    let h = if !GUIDED {
+                        router.heuristic_to_targets(&neighbor, &self.target_states, &self.target_hint)
+                    } else {
+                        match search_h(router, &self.opts, &neighbor, &self.target_states,
+                                       &self.target_hint) {
+                            Some(h) => h,
+                            None => continue,   // GPU-proven: cannot reach a target
+                        }
+                    };
                     if existing_g != i32::MAX {
                         sink.on_revisit();
                     }
@@ -851,7 +909,6 @@ impl GridSearch {
                     if self.opts.via_exclusion_radius > 0 {
                         self.path_vias.insert(neighbor_key, current_vias.clone());
                     }
-                    let h = router.heuristic_to_targets(&neighbor, &self.target_states, &self.target_hint);
                     self.open_set.push(OpenEntry {
                         f_score: new_g.saturating_add(h), // B4: no i32 wrap on huge h
                         g_score: new_g,
@@ -972,6 +1029,15 @@ impl GridSearch {
                 let new_g = g + (combined_via_cost + proximity_cost - via_shaping).max(0);
 
                 if new_g < existing_g {
+                    let h = if !GUIDED {
+                        router.heuristic_to_targets(&neighbor, &self.target_states, &self.target_hint)
+                    } else {
+                        match search_h(router, &self.opts, &neighbor, &self.target_states,
+                                       &self.target_hint) {
+                            Some(h) => h,
+                            None => continue,   // GPU-proven: cannot reach a target
+                        }
+                    };
                     if existing_g != i32::MAX {
                         sink.on_revisit();
                     }
@@ -986,7 +1052,6 @@ impl GridSearch {
                             self.path_vias.insert(neighbor_key, new_vias);
                         }
                     }
-                    let h = router.heuristic_to_targets(&neighbor, &self.target_states, &self.target_hint);
                     self.open_set.push(OpenEntry {
                         f_score: new_g.saturating_add(h), // B4: no i32 wrap on huge h
                         g_score: new_g,
@@ -1197,7 +1262,7 @@ impl GridRouter {
             sink.stats.initial_h = search.initial_h;
 
             loop {
-                match search.step(self, obstacles, &mut sink) {
+                match search.step::<_, false>(self, obstacles, &mut sink) {
                     SearchStep::Found(goal_idx, g) => {
                         let path = search.store.reconstruct_path(goal_idx);
                         let stats = &mut sink.stats;
@@ -1279,7 +1344,7 @@ impl GridRouter {
             search.set_iteration_ceiling(max_iterations_ceiling, quantum_cells, quantum_pct, grace_tranches);
 
             loop {
-                match search.step(self, obstacles, &mut sink) {
+                match search.step::<_, false>(self, obstacles, &mut sink) {
                     SearchStep::Found(goal_idx, _g) => {
                         let path = search.store.reconstruct_path(goal_idx);
                         return (Some(path), search.iterations, Vec::new());
@@ -1290,6 +1355,214 @@ impl GridRouter {
             }
 
             (None, search.iterations, sink.tracker.get_blocked())
+        })
+    }
+
+    /// Hybrid GPU search (route_with_frontier's full-search replacement).
+    ///
+    /// Floods the cost-to-go from the targets on the GPU over a window (bbox
+    /// of sources + targets grown by `margin` cells, optionally clipped to
+    /// `clip` = (x0, y0, x1, y1) but never cutting a terminal), with
+    /// PERMISSIVE legality (enterable = !is_blocked; vias where
+    /// is_via_blocked_rung allows or a free via exists) and lower-bound costs.
+    /// Then:
+    ///   * no source reachable and the flood never escaped the window ->
+    ///     "unreachable" (a proof: the CPU search could not succeed), with the
+    ///     blocked frontiers of the source and target regions;
+    ///   * otherwise the normal CPU A* runs with the field as its heuristic
+    ///     ("path" / "fail") -- every legality and cost decision stays the
+    ///     CPU's, so a GPU modelling error can only cost time, never an
+    ///     illegal route.
+    /// "cpu" = not attempted (no GPU in this process / build, an unsupported
+    /// search option, or the window is too large): run the CPU search.
+    /// Returns (path, iterations, fwd_blocked, bwd_blocked, verdict, gpu_ms).
+    #[pyo3(signature = (obstacles, sources, targets, max_iterations, clip=None, margin=200,
+                        collinear_vias=false, via_exclusion_radius=0,
+                        track_margin=TrackMarginArg::Scalar(0.0), max_iterations_ceiling=0,
+                        quantum_cells=2.0, quantum_pct=2.0, grace_tranches=0, via_rung=0,
+                        max_cells=40_000_000, prove_only=false))]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity, unused_variables)]
+    pub fn route_with_frontier_gpu(
+        &self,
+        py: Python<'_>,
+        obstacles: &GridObstacleMap,
+        sources: Vec<(i32, i32, u8)>,
+        targets: Vec<(i32, i32, u8)>,
+        max_iterations: u32,
+        clip: Option<(i32, i32, i32, i32)>,
+        margin: i32,
+        collinear_vias: bool,
+        via_exclusion_radius: i32,
+        track_margin: TrackMarginArg,
+        max_iterations_ceiling: u32,
+        quantum_cells: f64,
+        quantum_pct: f64,
+        grace_tranches: u32,
+        via_rung: usize,
+        max_cells: usize,
+        prove_only: bool,
+    ) -> (Option<Vec<(i32, i32, u8)>>, u32, Vec<(i32, i32, u8)>, Vec<(i32, i32, u8)>, String, f64) {
+        #[cfg(not(feature = "gpu"))]
+        { return (None, 0, Vec::new(), Vec::new(), "cpu".to_string(), 0.0); }
+        #[cfg(feature = "gpu")]
+        py.allow_threads(|| {
+            let cpu = || (None, 0u32, Vec::new(), Vec::new(), "cpu".to_string(), 0.0f64);
+            if collinear_vias || via_exclusion_radius > 0 || sources.is_empty() || targets.is_empty()
+                || !self.attraction_path.is_empty() || self.attraction_potential > 0
+                || (self.vertical_attraction_radius > 0 && self.vertical_attraction_bonus > 0) {
+                return cpu();
+            }
+            if !crate::lee::available() { return cpu(); }
+            let t0 = std::time::Instant::now();
+            // ---- window
+            let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+            for &(x, y, _) in sources.iter().chain(targets.iter()) {
+                x0 = x0.min(x); y0 = y0.min(y); x1 = x1.max(x); y1 = y1.max(y);
+            }
+            let (tx0, ty0, tx1, ty1) = (x0, y0, x1, y1);
+            x0 -= margin; y0 -= margin; x1 += margin; y1 += margin;
+            if let Some((cx0, cy0, cx1, cy1)) = clip {
+                x0 = x0.max(cx0.min(tx0)); y0 = y0.max(cy0.min(ty0));
+                x1 = x1.min(cx1.max(tx1)); y1 = y1.min(cy1.max(ty1));
+            }
+            let w = (x1 - x0 + 1) as usize;
+            let h = (y1 - y0 + 1) as usize;
+            let l = obstacles.num_layers;
+            let n = w * h * l;
+            if n == 0 || n > max_cells { return cpu(); }
+            // ---- export (parallel over rows of (layer, y))
+            let mut cell = vec![0u8; n];
+            let mut prox = vec![0u32; n];
+            let mut via = vec![0u8; w * h];
+            {
+                let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(1).min(16);
+                let rows = l * h;
+                let chunk = rows.div_ceil(threads).max(1);
+                std::thread::scope(|sc| {
+                    for (ci, (cc, pc)) in cell.chunks_mut(chunk * w).zip(prox.chunks_mut(chunk * w)).enumerate() {
+                        sc.spawn(move || {
+                            let r0 = ci * chunk;
+                            for (k, (crow, prow)) in cc.chunks_mut(w).zip(pc.chunks_mut(w)).enumerate() {
+                                let r = r0 + k;
+                                let (li, yy) = (r / h, r % h);
+                                let gy = y0 + yy as i32;
+                                for xx in 0..w {
+                                    let gx = x0 + xx as i32;
+                                    crow[xx] = (!obstacles.is_blocked(gx, gy, li)) as u8;
+                                    let p = obstacles.get_stub_proximity_cost(gx, gy)
+                                        + obstacles.get_layer_proximity_cost(gx, gy, li);
+                                    prow[xx] = p.max(0) as u32;
+                                }
+                            }
+                        });
+                    }
+                    let vchunk = h.div_ceil(threads).max(1);
+                    for (ci, vc) in via.chunks_mut(vchunk * w).enumerate() {
+                        sc.spawn(move || {
+                            for (k, vrow) in vc.chunks_mut(w).enumerate() {
+                                let gy = y0 + (ci * vchunk + k) as i32;
+                                for xx in 0..w {
+                                    let gx = x0 + xx as i32;
+                                    let ok = !obstacles.is_via_blocked_rung(gx, gy, via_rung);
+                                    let free = obstacles.is_free_via(gx, gy);
+                                    vrow[xx] = (ok as u8) | ((free as u8) << 1);
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+            let idx = |x: i32, y: i32, ly: u8| -> usize {
+                ((ly as usize * h) + (y - y0) as usize) * w + (x - x0) as usize
+            };
+            let mut seeds: Vec<u32> = Vec::with_capacity(targets.len());
+            for &(x, y, ly) in &targets {
+                if (ly as usize) < l { let c = idx(x, y, ly); cell[c] |= 3; seeds.push(c as u32); }
+            }
+            let lc: Vec<i32> = (0..l).map(|i| self.layer_costs.get(i).copied().unwrap_or(1000)).collect();
+            let (dist, _rounds) = match crate::lee::flood(w, h, l, &cell, &via, &prox, &lc,
+                                                          self.via_cost, self.via_proximity_cost, &seeds) {
+                Some(r) => r,
+                None => return cpu(),
+            };
+            // ---- containment: did the flood escape through an enterable border cell?
+            let mut contained = true;
+            'outer: for li in 0..l {
+                for yy in 0..h {
+                    let edge_row = yy == 0 || yy == h - 1;
+                    for xx in 0..w {
+                        if !edge_row && xx != 0 && xx != w - 1 { continue; }
+                        let c = (li * h + yy) * w + xx;
+                        if dist[c] != crate::lee::INF && (cell[c] & 1) != 0 { contained = false; break 'outer; }
+                    }
+                }
+            }
+            let reachable = sources.iter().any(|&(x, y, ly)| (ly as usize) < l && dist[idx(x, y, ly)] != crate::lee::INF);
+            let frontier = |d: &[u32], cl: &[u8]| -> Vec<(i32, i32, u8)> {
+                let mut tr = crate::types::BlockedCellTracker::new();
+                const DX: [i32; 8] = [1, -1, 0, 0, 1, 1, -1, -1];
+                const DY: [i32; 8] = [0, 0, 1, -1, 1, -1, 1, -1];
+                for li in 0..l {
+                    for yy in 0..h {
+                        for xx in 0..w {
+                            let c = (li * h + yy) * w + xx;
+                            if d[c] == crate::lee::INF { continue; }
+                            for k in 0..8 {
+                                let (nx, ny) = (xx as i32 + DX[k], yy as i32 + DY[k]);
+                                if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 { continue; }
+                                let nc = (li * h + ny as usize) * w + nx as usize;
+                                if cl[nc] & 1 == 0 {
+                                    tr.track(x0 + nx, y0 + ny, li as u8);
+                                }
+                            }
+                        }
+                    }
+                }
+                tr.get_blocked()
+            };
+            if !reachable && contained {
+                let bwd = frontier(&dist, &cell);
+                // Source region (for the forward frontier): flood from the sources.
+                let mut cell_s = cell.clone();
+                for c in cell_s.iter_mut() { *c &= 1; }
+                let mut sseeds: Vec<u32> = Vec::new();
+                for &(x, y, ly) in &sources {
+                    if (ly as usize) < l { let c = idx(x, y, ly); cell_s[c] |= 3; sseeds.push(c as u32); }
+                }
+                let fwd = match crate::lee::flood(w, h, l, &cell_s, &via, &prox, &lc,
+                                                  self.via_cost, self.via_proximity_cost, &sseeds) {
+                    Some((ds, _)) => frontier(&ds, &cell_s),
+                    None => Vec::new(),
+                };
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                return (None, 0, fwd, bwd, "unreachable".to_string(), ms);
+            }
+            let gpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if prove_only {
+                // Only the proof was asked for: the caller runs its own search.
+                return (None, 0, Vec::new(), Vec::new(), "reachable".to_string(), gpu_ms);
+            }
+            let table = std::sync::Arc::new(HTable {
+                x0, y0, w: w as i32, h: h as i32, l: l as i32, contained, data: dist,
+            });
+            let mut opts = SearchOptions::new(collinear_vias, via_exclusion_radius,
+                                              None, None, 2, track_margin);
+            opts.via_rung = via_rung;
+            opts.h_table = Some(table);
+            let mut sink = FrontierSink::new();
+            let mut search = GridSearch::new(self, sources, targets, max_iterations, opts, &mut sink);
+            search.set_iteration_ceiling(max_iterations_ceiling, quantum_cells, quantum_pct, grace_tranches);
+            loop {
+                match search.step::<_, true>(self, obstacles, &mut sink) {
+                    SearchStep::Found(goal_idx, _g) => {
+                        let path = search.store.reconstruct_path(goal_idx);
+                        return (Some(path), search.iterations, Vec::new(), Vec::new(), "path".to_string(), gpu_ms);
+                    }
+                    SearchStep::IterationCap | SearchStep::Exhausted => break,
+                    SearchStep::Progress(_) | SearchStep::Skipped => {}
+                }
+            }
+            (None, search.iterations, sink.tracker.get_blocked(), Vec::new(), "fail".to_string(), gpu_ms)
         })
     }
 }

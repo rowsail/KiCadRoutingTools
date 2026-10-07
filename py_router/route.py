@@ -6460,6 +6460,15 @@ For differential pair routing, use route_diff.py:
                         help="Direction search order for each net route")
     # #381 D9: accept the singular --no-bga-zone spelling too (the plane/fanout
     # scripts spell it singular); same nargs='*' dest -- additive, plural kept.
+    parser.add_argument("--no-gpu-search", action="store_true",
+                        help="Turn OFF the hybrid GPU wavefront search (on by default when "
+                             "grid_router has GPU support and a CUDA device is usable): when "
+                             "a net's quick CPU probes fail, a GPU flood either proves no "
+                             "path exists (skipping the long CPU search) or guides the CPU "
+                             "A* straight to the target. The CPU still makes every routing "
+                             "decision. Without a usable GPU it is inert.")
+    parser.add_argument("--gpu-search", action="store_true",
+                        help="Explicitly request the GPU wavefront search (the default).")
     parser.add_argument("--gpu-plan", action="store_true",
                         help="EXPERIMENTAL: run a negotiated-congestion global plan before "
                              "routing, on the GPU when grid_router was built with GPU "
@@ -6789,6 +6798,9 @@ For differential pair routing, use route_diff.py:
     if args.gpu_plan:
         from gpu_plan import request_gpu_plan
         request_gpu_plan(True)
+    if args.no_gpu_search or args.gpu_search:
+        from single_ended_routing import request_gpu_search
+        request_gpu_search('off' if args.no_gpu_search else 'on')
     # #439: the PRESENCE of --clearance is the clamp switch. Given -> it is the
     # ceiling: non-Default classes are capped at min(class, --clearance) and the
     # output .kicad_pro clamps them to the routed floor. Omitted -> honor the
