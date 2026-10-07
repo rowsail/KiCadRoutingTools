@@ -253,6 +253,7 @@ class FragilityField:
         emitted = st.mask & (st.dist > 0)
         if not emitted.any():
             st.rows = None
+            self._mark_dirty(st)
             return
         jj, ii = np.nonzero(emitted)
         frag = 1.0 - (st.dist[jj, ii].astype(np.float64) - 1) / self.depth
@@ -265,6 +266,7 @@ class FragilityField:
             (jj + st.gy0).astype(np.int32),
             costs,
         ])
+        self._mark_dirty(st)
 
     def refresh(self, pcb_data, segments, vias):
         """Copper changed (commit, rip, or restore): re-carve + re-erode the
@@ -323,7 +325,74 @@ class FragilityField:
             self.refreshes += 1
         self.refresh_s += _time.perf_counter() - t0
 
+    def _mark_dirty(self, st):
+        # _PourState uses __slots__, so dirtiness lives on the field.
+        d = getattr(self, '_dirty_ids', None)
+        if d is None:
+            d = self._dirty_ids = set()
+        d.add(id(st))
+
+    @staticmethod
+    def _merge_rows(rows):
+        """The original publish dedup for a list of row arrays: sort by
+        (layer, gx, gy, cost, original index) and keep each cell's last
+        (max-cost) row."""
+        out = np.vstack(rows)
+        o64 = out.astype(np.int64)
+        mins = o64.min(axis=0)
+        spans = o64.max(axis=0) - mins + 1
+        if int(spans[0]) * int(spans[1]) * int(spans[2]) * int(spans[3]) < (1 << 62):
+            cell_key = ((o64[:, 0] - mins[0]) * spans[1]
+                        + (o64[:, 1] - mins[1])) * spans[2] + (o64[:, 2] - mins[2])
+            order = np.argsort(cell_key * spans[3] + (o64[:, 3] - mins[3]),
+                               kind='stable')
+            out = out[order]
+            same = np.diff(cell_key[order]) == 0
+        else:
+            order = np.lexsort((out[:, 3], out[:, 2], out[:, 1], out[:, 0]))
+            out = out[order]
+            same = ((np.diff(out[:, 0]) == 0) & (np.diff(out[:, 1]) == 0)
+                    & (np.diff(out[:, 2]) == 0))
+        keep = np.ones(len(out), dtype=bool)
+        keep[:-1][same] = False
+        return out[keep]
+
     def publish(self):
+        # Incremental, identical result: the global (layer, gx, gy, cost)
+        # sort groups rows by layer, so the output is each layer's own
+        # sorted+deduped block, concatenated in layer order. Recompute only
+        # the layers whose states regenerated rows (or whose set of states
+        # with rows changed); the others reuse their cached block.
+        by_layer: Dict[int, list] = {}
+        for st in self.states:
+            if st.rows is not None:
+                by_layer.setdefault(int(st.li), []).append(st)
+        dirty = getattr(self, '_dirty_ids', set())
+        if not by_layer:
+            self._layer_blocks = {}
+            self._dirty_ids = set()
+            self.cache.pop(PLANE_FRAGILITY_CACHE_KEY, None)
+            return
+        blocks = getattr(self, '_layer_blocks', None)
+        if blocks is None:
+            blocks = {}            # first publish: every layer recomputes
+        new_blocks = {}
+        for li, sts in by_layer.items():
+            members = tuple(id(st) for st in sts)
+            cached = blocks.get(li)
+            if (cached is not None and cached[0] == members
+                    and not any(id(st) in dirty for st in sts)):
+                new_blocks[li] = cached
+            else:
+                new_blocks[li] = (members, self._merge_rows([st.rows for st in sts]))
+        self._dirty_ids = set()
+        self._layer_blocks = new_blocks
+        self.cache[PLANE_FRAGILITY_CACHE_KEY] = np.vstack(
+            [new_blocks[li][1] for li in sorted(new_blocks)])
+        return
+
+    def _publish_reference(self):
+        """The original (full re-sort) publish, kept for equivalence tests."""
         rows = [st.rows for st in self.states if st.rows is not None]
         if rows:
             out = np.vstack(rows)
