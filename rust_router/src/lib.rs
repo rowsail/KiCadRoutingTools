@@ -14,6 +14,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;  // v0.17.3: return free
 mod types;
 mod refmap;
 mod raster;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod obstacle_map;
 mod router;
 mod dubins;
@@ -139,6 +141,13 @@ fn identify_blocking_obstacles(
 }
 
 /// Python module
+/// False: this build has no GPU support (built without the `gpu` feature).
+#[cfg(not(feature = "gpu"))]
+#[pyfunction]
+fn gpu_available() -> bool {
+    false
+}
+
 #[pymodule]
 fn grid_router(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -151,5 +160,12 @@ fn grid_router(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(raster::disk_spans, m)?)?;
     m.add_function(wrap_pyfunction!(raster::seg_foreign_min_dist, m)?)?;
     m.add_function(wrap_pyfunction!(raster::pad_foreign_min_dist, m)?)?;
+    #[cfg(feature = "gpu")]
+    {
+        m.add_function(wrap_pyfunction!(gpu::gpu_available, m)?)?;
+        m.add_class::<gpu::GpuGlobalRouter>()?;
+    }
+    #[cfg(not(feature = "gpu"))]
+    m.add_function(wrap_pyfunction!(gpu_available, m)?)?;
     Ok(())
 }

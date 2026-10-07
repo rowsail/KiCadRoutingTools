@@ -291,6 +291,8 @@ _PARAM_CONTROL_ALIASES = {
     'fab_overrides': 'fab_overrides_path',
     # #856: the opt-in severity relaxation checkbox (Options tab).
     'relax_drc_severities': 'relax_drc_severities_check',
+    # GPU global plan option (Options tab; CLI --gpu-plan).
+    'gpu_plan': 'gpu_plan_check',
 }
 # _PARAM_SPECIAL: params handled by _apply_special() (composite / inverted /
 # panel-backed controls that a plain SetValue can't fill).

@@ -60,6 +60,20 @@ from .gui_utils import StdoutRedirector, board_minima_from_live
 from .settings_persistence import get_dialog_settings, restore_dialog_settings
 
 
+def _gpu_plan_status():
+    """(usable, tooltip line) for the GPU global plan option."""
+    try:
+        import grid_router
+        if not hasattr(grid_router, 'GpuGlobalRouter'):
+            return False, ("Unavailable: the installed grid_router library was "
+                           "built without GPU support (cargo feature 'gpu').")
+        if not grid_router.gpu_available():
+            return False, "Unavailable: no usable CUDA device / driver found."
+        return True, "A CUDA GPU is available."
+    except Exception as e:
+        return False, f"Unavailable: {e}"
+
+
 def _build_layer_mappings():
     """Build layer name <-> ID mappings using pcbnew.
 
@@ -1554,6 +1568,26 @@ class RoutingDialog(wx.Dialog):
             "--relax-drc-severities; the previous values are kept in the project.")
         options_inner.Add(self.relax_drc_severities_check, 0, wx.ALL, 3)
 
+        gpu_label = wx.StaticText(options_scroll, label="GPU:")
+        gpu_label.SetFont(gpu_label.GetFont().Bold())
+        options_inner.Add(gpu_label, 0, wx.LEFT | wx.TOP, 3)
+        self.gpu_plan_check = wx.CheckBox(
+            options_scroll, label="GPU global plan (experimental)")
+        self.gpu_plan_check.SetValue(False)
+        _gpu_ok, _gpu_why = _gpu_plan_status()
+        self.gpu_plan_check.SetToolTip(
+            "Before routing, plan all nets together with negotiated congestion "
+            "(PathFinder) on the GPU, then route using the plan as guidance. It can "
+            "help when nets fail because they compete for the same channels; it "
+            "does not help pins boxed in by pad clearance. OFF by default: routing "
+            "is unchanged when unticked. Matches the CLI's --gpu-plan.\n\n"
+            "EXPERIMENTAL: a different routing order can expose router bugs -- "
+            "always run DRC on the result and compare it with a normal run.\n\n"
+            + _gpu_why)
+        if not _gpu_ok:
+            self.gpu_plan_check.Enable(False)
+        options_inner.Add(self.gpu_plan_check, 0, wx.ALL, 3)
+
         options_inner.AddSpacer(10)
 
         # MPS options
@@ -1955,6 +1989,7 @@ class RoutingDialog(wx.Dialog):
                 # #581: one via-in-pad policy for every step (Basic tab).
                 'same_net_pad_clearance': self._same_net_pad_clearance_value(),
                 'relax_drc_severities': self.relax_drc_severities_check.GetValue(),
+                'gpu_plan': self.gpu_plan_check.GetValue(),
                 'clamp_netclasses': self._ceiling_on(),
                 'fab_tier': self.fab_tier.GetString(self.fab_tier.GetSelection()),
                 'fab_overrides_path': self.fab_overrides_path.GetValue().strip(),
@@ -2717,6 +2752,7 @@ class RoutingDialog(wx.Dialog):
         self.add_teardrops_check.SetValue(False)  # match creation default + CLI (--add-teardrops off)
         # #856: severity relaxation is opt-in per step (CLI --relax-drc-severities off).
         self.relax_drc_severities_check.SetValue(False)
+        self.gpu_plan_check.SetValue(False)
         # #857/#530: the CLI defaults, from the one place they live.
         self.fab_tier.SetStringSelection(defaults.FAB_TIER)
         self.escalation.SetStringSelection(defaults.ESCALATION)
@@ -3105,6 +3141,7 @@ class RoutingDialog(wx.Dialog):
             'add_teardrops': self.add_teardrops_check.GetValue(),
             'fix_drc_settings': self.fix_drc_check.GetValue(),
             'relax_drc_severities': self.relax_drc_severities_check.GetValue(),
+            'gpu_plan': self.gpu_plan_check.GetValue(),
             'clamp_netclasses': self._ceiling_on(),
             # Guide corridor (issue #7)
             'guide_corridor_enabled': self.guide_corridor_check.GetValue(),
@@ -3587,7 +3624,16 @@ class RoutingDialog(wx.Dialog):
                           f"plane-finalize oracle: {e})")
                     return None
 
-            def run_batch(net_names, track_width, clearance, via_size, via_drill):
+            def run_batch(*a, **kw):
+                # GPU global plan option: on only for this routing run.
+                from gpu_plan import request_gpu_plan
+                request_gpu_plan(bool(config.get('gpu_plan')))
+                try:
+                    return _run_batch(*a, **kw)
+                finally:
+                    request_gpu_plan(False)
+
+            def _run_batch(net_names, track_width, clearance, via_size, via_drill):
                 """Run batch_route with given parameters."""
                 return batch_route(
                     input_file=self.board_filename,

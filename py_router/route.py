@@ -6460,6 +6460,11 @@ For differential pair routing, use route_diff.py:
                         help="Direction search order for each net route")
     # #381 D9: accept the singular --no-bga-zone spelling too (the plane/fanout
     # scripts spell it singular); same nargs='*' dest -- additive, plural kept.
+    parser.add_argument("--gpu-plan", action="store_true",
+                        help="EXPERIMENTAL: run a negotiated-congestion global plan before "
+                             "routing, on the GPU when grid_router was built with GPU "
+                             "support and a CUDA device is usable (CPU probes otherwise). "
+                             "Off by default; routing is unchanged when not given.")
     parser.add_argument("--no-bga-zones", "--no-bga-zone", nargs="*", default=None,
                         help="Disable BGA exclusion zones. No args = disable all. With component refs (e.g., U1 U3) = disable only those.")
     parser.add_argument("--rip-existing-nets", nargs="+", default=None,
@@ -6781,6 +6786,9 @@ For differential pair routing, use route_diff.py:
     # negative rail (-12V, -5V) is read as an unknown option and argparse exits
     # 2 before this line's result is ever used.
     args = __import__("cli_nets").pin_dash_digit_values(parser).parse_args()
+    if args.gpu_plan:
+        from gpu_plan import request_gpu_plan
+        request_gpu_plan(True)
     # #439: the PRESENCE of --clearance is the clamp switch. Given -> it is the
     # ceiling: non-Default classes are capped at min(class, --clearance) and the
     # output .kicad_pro clamps them to the routed floor. Omitted -> honor the

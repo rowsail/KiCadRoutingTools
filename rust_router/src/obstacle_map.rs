@@ -725,6 +725,32 @@ impl GridObstacleMap {
         self.is_via_blocked(gx, gy)
     }
 
+    /// Dense snapshot of a w x h window at grid origin (gx0, gy0): track
+    /// blocking per layer as [L, h, w] u8 and via blocking as [h, w] u8, each
+    /// 0 free / 1 blocked by copper keep-outs (is_blocked / is_via_blocked)
+    /// / 2 permanently blocked (static: edge, outline, cutouts) -- the GPU
+    /// global router's input grid.
+    pub fn export_dense<'py>(&self, py: Python<'py>, gx0: i32, gy0: i32, w: usize, h: usize)
+        -> (Bound<'py, numpy::PyArray3<u8>>, Bound<'py, numpy::PyArray2<u8>>) {
+        use numpy::IntoPyArray;
+        let mut t = numpy::ndarray::Array3::<u8>::zeros((self.num_layers, h, w));
+        let mut v = numpy::ndarray::Array2::<u8>::zeros((h, w));
+        for y in 0..h {
+            for x in 0..w {
+                let (gx, gy) = (gx0 + x as i32, gy0 + y as i32);
+                // 2 = permanent (board edge / outline / cutouts: static bitmap),
+                // 1 = other copper's keep-out, 0 = free.
+                for l in 0..self.num_layers {
+                    if self.static_blocked_bitmap.test(gx, gy, l) { t[[l, y, x]] = 2; }
+                    else if self.is_blocked(gx, gy, l) { t[[l, y, x]] = 1; }
+                }
+                if self.static_via_bitmap.test(gx, gy, 0) { v[[y, x]] = 2; }
+                else if self.is_via_blocked(gx, gy) { v[[y, x]] = 1; }
+            }
+        }
+        (t.into_pyarray(py), v.into_pyarray(py))
+    }
+
     /// Batch add blocked cells from numpy array (shape: N x 3, columns: gx, gy, layer)
     pub fn add_blocked_cells_batch(&mut self, cells: PyReadonlyArray2<i32>) {
         let arr = cells.as_array();

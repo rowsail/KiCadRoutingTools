@@ -126,7 +126,8 @@ def plan_global_routes(pcb_data, config, net_ids: List[Tuple[str, int]],
     gate is off or there is nothing to probe; failed probes are counted and
     simply contribute no reservation and no ordering signal."""
     k = global_plan_knobs()
-    if not k['enable'] or not net_ids:
+    from gpu_plan import gpu_plan_requested
+    if not (k['enable'] or gpu_plan_requested()) or not net_ids:
         return None
     # Deferred imports: single_ended_routing must not import this module
     # (the bus_corridor convention), and routing_context imports
@@ -196,6 +197,36 @@ def plan_global_routes(pcb_data, config, net_ids: List[Tuple[str, int]],
             print(f"  [plan] power-first probing: "
                   f"{sum(1 for t in _probe_order if t[1] in _pw)} power "
                   f"net(s) probed ahead of signals")
+    # GPU engine (gpu_plan.py): one negotiated-congestion PathFinder run for
+    # every net replaces the per-net CPU probes below; its paths fill the same
+    # plan fields, so everything downstream is unchanged.
+    from gpu_plan import plan_engine, gpu_rough_paths
+    _gpu = None
+    if plan_engine() == 'gpu':
+        try:
+            _gpu = gpu_rough_paths(pcb_data, config, list(_probe_order),
+                                   layer_map, probe_map)
+        except Exception as _ge:                       # noqa: BLE001
+            print(f"  [plan] GPU engine failed ({_ge}); using CPU probes")
+            _gpu = None
+    if _gpu is not None:
+        _gs = _gpu['stats']
+        print(f"  [plan] GPU PathFinder: {len(_gpu['paths'])}/{_gs['nets']} nets, "
+              f"{_gs['iterations']} iteration(s), {_gs['overused_cells']} overused "
+              f"cell(s), {_gs['failed_nets']} unrouted, grid {_gs['grid']}, "
+              f"{_gs['total_s']:.1f}s (export {_gs['export_s']:.1f}s)")
+        plan.probe_failures = len(ids) - len(_gpu['paths'])
+        for nid, path in _gpu['paths'].items():
+            plan.rough_paths[nid] = path
+            if k['cost'] > 0:
+                rows, via_pos = compute_ripped_route_costs(
+                    _gpu['results'][nid], res_cfg, layer_map)
+                rows = _scale_rows_in_collars(rows, collar_rects, k['zone_scale'])
+                if len(rows):
+                    plan.reservations[nid] = rows
+                if via_pos:
+                    plan.via_sites[nid] = via_pos
+        _probe_order = []
     for _name, nid in _probe_order:
         result = route_net_with_obstacles(pcb_data, nid, rough_cfg, probe_map)
         _it = int((result or {}).get('iterations', 0) or 0)
