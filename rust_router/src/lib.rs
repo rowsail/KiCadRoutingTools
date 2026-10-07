@@ -149,5 +149,7 @@ fn grid_router(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(raster::capsule_spans, m)?)?;
     m.add_function(wrap_pyfunction!(raster::pad_offsets, m)?)?;
     m.add_function(wrap_pyfunction!(raster::disk_spans, m)?)?;
+    m.add_function(wrap_pyfunction!(raster::seg_foreign_min_dist, m)?)?;
+    m.add_function(wrap_pyfunction!(raster::pad_foreign_min_dist, m)?)?;
     Ok(())
 }

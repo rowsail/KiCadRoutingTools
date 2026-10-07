@@ -4230,7 +4230,7 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
     from collections import defaultdict
     from check_connected import check_net_connectivity
     from geometry_utils import segment_to_segment_closest_points, segments_intersect
-    from single_ended_routing import (_seg_foreign_pad_dist, _seg_foreign_seg_dist,
+    from single_ended_routing import (_seg_foreign_seg_below, _seg_foreign_pad_below, _seg_foreign_pad_dist, _seg_foreign_seg_dist,
                                       _seg_foreign_via_dist, _seg_foreign_hole_dist)
     from routing_defaults import NPTH_TO_TRACK_CLEARANCE
     from check_drc import (board_edge_geometry, _point_on_board,
@@ -4411,17 +4411,27 @@ def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
 
     def clears(x1, y1, x2, y2, layer, net_id, w):
         eff = pair_base(net_id, layer)
-        pd = _seg_foreign_pad_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
-                                   base_clearance=eff, net_clearances=net_clearances)
-        d = min(pd,
-                _seg_foreign_seg_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
-                                      net_clearances=net_clearances, base_clearance=eff,
-                                      track_clearances=_trk_clr),  # dru track rules
-                _seg_foreign_via_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
-                                      net_clearances=net_clearances, base_clearance=eff))
-        hd = _seg_foreign_hole_dist(pcb_data, net_id, x1, y1, x2, y2)
-        ok = (d >= eff + w / 2.0 - 1e-4 and
-              hd >= npth_clr + w / 2.0 - 1e-4 and
+        # min(pd, seg, via) >= T, evaluated as ordered threshold tests: the
+        # pad and segment terms only need "below T?" (_seg_foreign_*_below),
+        # and a term already below T decides the answer without the others.
+        # (#665 trace mode keeps the full pad distance it compares.)
+        _T = eff + w / 2.0 - 1e-4
+        if _665trace:
+            pd = _seg_foreign_pad_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
+                                       base_clearance=eff, net_clearances=net_clearances)
+            _pad_ok = pd >= _T
+        else:
+            _pad_ok = not _seg_foreign_pad_below(pcb_data, net_id, x1, y1, x2, y2, layer, _T,
+                                                 base_clearance=eff,
+                                                 net_clearances=net_clearances)
+        ok = (_pad_ok and
+              not _seg_foreign_seg_below(pcb_data, net_id, x1, y1, x2, y2, layer, _T,
+                                         net_clearances=net_clearances, base_clearance=eff,
+                                         track_clearances=_trk_clr) and  # dru track rules
+              _seg_foreign_via_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
+                                    net_clearances=net_clearances, base_clearance=eff) >= _T and
+              _seg_foreign_hole_dist(pcb_data, net_id, x1, y1, x2, y2)
+              >= npth_clr + w / 2.0 - 1e-4 and
               edge_clears(x1, y1, x2, y2, w) and
               keepout_clears(x1, y1, x2, y2, layer, w))
         if _665trace and ok:
@@ -5554,7 +5564,7 @@ def nudge_grazing_microshift(results, pcb_data: PCBData, scope_net_ids=None,
     min_hole_clearance is read off `pcb_data.source_path` either way."""
     from collections import defaultdict
     from check_connected import check_net_connectivity
-    from single_ended_routing import (_seg_foreign_pad_dist, _seg_foreign_seg_dist,
+    from single_ended_routing import (_seg_foreign_seg_below, _seg_foreign_pad_below, _seg_foreign_pad_dist, _seg_foreign_seg_dist,
                                       _seg_foreign_via_dist, _seg_foreign_hole_dist)
     from routing_defaults import NPTH_TO_TRACK_CLEARANCE
     from obstacle_map import resolve_hole_clearance
@@ -5682,15 +5692,17 @@ def nudge_grazing_microshift(results, pcb_data: PCBData, scope_net_ids=None,
         # only on the handful that fail this.
         eff = eff_clr(s.net_id)  # #436 own floor; foreign class excess folded in
         thr = eff + s.width / 2.0 - 1e-4
-        if min(_seg_foreign_pad_dist(pcb_data, s.net_id, s.start_x, s.start_y,
-                                     s.end_x, s.end_y, s.layer,
-                                     base_clearance=eff),
-               _seg_foreign_seg_dist(pcb_data, s.net_id, s.start_x, s.start_y,
-                                     s.end_x, s.end_y, s.layer,
-                                     net_clearances=net_clearances, base_clearance=eff),
-               _seg_foreign_via_dist(pcb_data, s.net_id, s.start_x, s.start_y,
-                                     s.end_x, s.end_y, s.layer,
-                                     net_clearances=net_clearances, base_clearance=eff)) < thr:
+        # min(pad, seg, via) < thr as ordered threshold tests (first hit wins).
+        if (_seg_foreign_pad_below(pcb_data, s.net_id, s.start_x, s.start_y,
+                                   s.end_x, s.end_y, s.layer, thr,
+                                   base_clearance=eff) or
+                _seg_foreign_seg_below(pcb_data, s.net_id, s.start_x, s.start_y,
+                                       s.end_x, s.end_y, s.layer, thr,
+                                       net_clearances=net_clearances, base_clearance=eff) or
+                _seg_foreign_via_dist(pcb_data, s.net_id, s.start_x, s.start_y,
+                                      s.end_x, s.end_y, s.layer,
+                                      net_clearances=net_clearances,
+                                      base_clearance=eff) < thr):
             return True
         # NPTH-hole graze uses the higher NPTH-to-track floor (issue #308),
         # with each hole's own override folded into the distance (#760).

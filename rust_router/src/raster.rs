@@ -213,3 +213,103 @@ pub fn disk_spans(x: f64, y: f64, r: f64, x0: f64, y0: f64, res: f64,
     }
     spans
 }
+
+/// Port of single_ended_routing._seg_foreign_seg_dist's distance core: the
+/// minimum, over n+1 samples along (x1,y1)-(x2,y2) and every listed foreign
+/// segment/via (degenerate segment), of
+///     hypot(sample - closest point on foreign centreline) - hw - excess.
+/// Same arithmetic, same order as the numpy original (linspace as
+/// i * (1/n) with the last sample exactly 1.0; np.clip / np.where semantics;
+/// libm hypot), so the minimum is bit-identical.
+#[pyfunction]
+#[pyo3(signature = (x1, y1, x2, y2, n, ax, ay, bx, by, hw, excess=None, stop_below=None))]
+#[allow(clippy::too_many_arguments)]
+pub fn seg_foreign_min_dist(x1: f64, y1: f64, x2: f64, y2: f64, n: usize,
+                            ax: numpy::PyReadonlyArray1<f64>, ay: numpy::PyReadonlyArray1<f64>,
+                            bx: numpy::PyReadonlyArray1<f64>, by: numpy::PyReadonlyArray1<f64>,
+                            hw: numpy::PyReadonlyArray1<f64>,
+                            excess: Option<numpy::PyReadonlyArray1<f64>>,
+                            stop_below: Option<f64>) -> f64 {
+    let (ax, ay, bx, by, hw) = (ax.as_array(), ay.as_array(), bx.as_array(), by.as_array(), hw.as_array());
+    let ex = excess.as_ref().map(|e| e.as_array());
+    let m = ax.len();
+    let step = 1.0 / n as f64;                       // np.linspace: delta / div
+    let mut best = f64::INFINITY;
+    let mut nan = false;                            // np.min propagates NaN
+    for i in 0..=n {
+        let t = if i == n { 1.0 } else { i as f64 * step + 0.0 };
+        let sx = x1 + (x2 - x1) * t;
+        let sy = y1 + (y2 - y1) * t;
+        for j in 0..m {
+            let abx = bx[j] - ax[j];
+            let aby = by[j] - ay[j];
+            let l2 = abx * abx + aby * aby;
+            let pax = sx - ax[j];
+            let pay = sy - ay[j];
+            let safe = if l2 > 0.0 { l2 } else { 1.0 };
+            let mut tt = (pax * abx + pay * aby) / safe;
+            tt = if l2 > 0.0 { if tt < 0.0 { 0.0 } else if tt > 1.0 { 1.0 } else { tt } } else { 0.0 };
+            let projx = ax[j] + tt * abx;
+            let projy = ay[j] + tt * aby;
+            let mut d = (sx - projx).hypot(sy - projy) - hw[j];
+            if let Some(e) = &ex { d -= e[j]; }
+            if d.is_nan() { nan = true; } else if d < best {
+                best = d;
+                // Threshold mode: the caller only asks "is the minimum below
+                // stop_below?" -- any qualifying value answers it.
+                if let Some(sb) = stop_below { if d < sb && !nan { return d; } }
+            }
+        }
+    }
+    if nan { f64::NAN } else { best }
+}
+
+#[inline]
+fn np_max0(x: f64) -> f64 {
+    // np.maximum(x, 0.0): NaN propagates
+    if x.is_nan() { x } else if x > 0.0 { x } else { 0.0 }
+}
+
+/// Port of single_ended_routing._seg_foreign_pad_dist's vectorized core:
+/// min over n+1 samples along the segment and the listed pads of the
+/// rounded-rect signed edge distance (pad-local frame via rc/rs), minus the
+/// per-pad clearance excess when given. Same arithmetic and order as numpy
+/// (bit-identical); stop_below returns early once a value below it is seen.
+#[pyfunction]
+#[pyo3(signature = (x1, y1, x2, y2, n, cx, cy, hx, hy, cr, rc, rs, excess=None, stop_below=None))]
+#[allow(clippy::too_many_arguments)]
+pub fn pad_foreign_min_dist(x1: f64, y1: f64, x2: f64, y2: f64, n: usize,
+                            cx: numpy::PyReadonlyArray1<f64>, cy: numpy::PyReadonlyArray1<f64>,
+                            hx: numpy::PyReadonlyArray1<f64>, hy: numpy::PyReadonlyArray1<f64>,
+                            cr: numpy::PyReadonlyArray1<f64>, rc: numpy::PyReadonlyArray1<f64>,
+                            rs: numpy::PyReadonlyArray1<f64>,
+                            excess: Option<numpy::PyReadonlyArray1<f64>>,
+                            stop_below: Option<f64>) -> f64 {
+    let (cx, cy, hx, hy) = (cx.as_array(), cy.as_array(), hx.as_array(), hy.as_array());
+    let (cr, rc, rs) = (cr.as_array(), rc.as_array(), rs.as_array());
+    let ex = excess.as_ref().map(|e| e.as_array());
+    let m = cx.len();
+    let step = 1.0 / n as f64;
+    let mut best = f64::INFINITY;
+    let mut nan = false;
+    for i in 0..=n {
+        let t = if i == n { 1.0 } else { i as f64 * step + 0.0 };
+        let sx = x1 + (x2 - x1) * t;
+        let sy = y1 + (y2 - y1) * t;
+        for j in 0..m {
+            let ddx = sx - cx[j];
+            let ddy = sy - cy[j];
+            let lx = (ddx * rc[j] + ddy * rs[j]).abs();
+            let ly = (-ddx * rs[j] + ddy * rc[j]).abs();
+            let dx = np_max0(lx - (hx[j] - cr[j]));
+            let dy = np_max0(ly - (hy[j] - cr[j]));
+            let mut d = dx.hypot(dy) - cr[j];
+            if let Some(e) = &ex { d -= e[j]; }
+            if d.is_nan() { nan = true; } else if d < best {
+                best = d;
+                if let Some(sb) = stop_below { if d < sb && !nan { return d; } }
+            }
+        }
+    }
+    if nan { f64::NAN } else { best }
+}

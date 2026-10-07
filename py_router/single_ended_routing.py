@@ -321,6 +321,60 @@ def _seg_foreign_pad_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
     return min(float(np.min(d)), best_custom)
 
 
+def _seg_foreign_pad_below(pcb_data, net_id, x1, y1, x2, y2, layer, thr,
+                           base_clearance=None, net_clearances=None):
+    """Exactly `_seg_foreign_pad_dist(...) < thr`, cheaper: the custom-pad term
+    is checked first, then only pads whose bbox (global half-extents) grown by
+    thr + their clearance excess reaches the segment can qualify (a subset of
+    the original R window), and the Rust core stops at the first sample
+    below thr. The numpy path is the fallback."""
+    from routing_utils import _rust_raster
+    _rust = _rust_raster('pad_foreign_min_dist')
+    if _rust is None:
+        return _seg_foreign_pad_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
+                                     base_clearance=base_clearance,
+                                     net_clearances=net_clearances) < thr
+    nids, cx, cy, hx, hy, cr, rc, rs, ex, ey, plc, custom = \
+        _foreign_pad_arrays(pcb_data, layer)
+    n = max(2, int(math.hypot(x2 - x1, y2 - y1) / 0.02) + 1)
+    if custom:
+        _t = np.linspace(0.0, 1.0, n + 1)
+        sx = x1 + (x2 - x1) * _t
+        sy = y1 + (y2 - y1) * _t
+        if _custom_pad_min_dist(custom, net_id, list(zip(sx, sy)), base_clearance) < thr:
+            return True
+    elif 1e9 < thr:
+        return True
+    if cx.size == 0:
+        return False
+    R = _FOREIGN_PAD_WINDOW
+    sx0, sx1 = min(x1, x2), max(x1, x2)
+    sy0, sy1 = min(y1, y2), max(y1, y2)
+    near = ((cx + ex >= sx0 - R) & (cx - ex <= sx1 + R) &
+            (cy + ey >= sy0 - R) & (cy - ey <= sy1 + R) & (nids != net_id))
+    if not near.any():
+        return False
+    excess = None
+    if base_clearance is not None:
+        excess = np.maximum(plc[near] - base_clearance, 0.0)
+        if net_clearances:
+            fcls = np.array([max(0.0, net_clearances.get(int(f), base_clearance) - base_clearance)
+                             for f in nids[near]], dtype=float)
+            excess = np.maximum(excess, fcls)
+    idx = np.flatnonzero(near)
+    reach = thr + (excess if excess is not None else 0.0)
+    keep = ((cx[idx] + ex[idx] >= sx0 - reach) & (cx[idx] - ex[idx] <= sx1 + reach) &
+            (cy[idx] + ey[idx] >= sy0 - reach) & (cy[idx] - ey[idx] <= sy1 + reach))
+    if not keep.any():
+        return False
+    sel = idx[keep]
+    exk = excess[keep] if excess is not None else None
+    c = lambda a: np.ascontiguousarray(a[sel], dtype=float)
+    d = _rust(float(x1), float(y1), float(x2), float(y2), n,
+              c(cx), c(cy), c(hx), c(hy), c(cr), c(rc), c(rs), exk, float(thr))
+    return d < thr
+
+
 def _foreign_seg_arrays(pcb_data, layer):
     """Cached per-layer numpy arrays (net_id, x1, y1, x2, y2, half_width) for every
     routed SEGMENT on `layer`, plus every VIA folded in as a degenerate (zero-length)
@@ -427,6 +481,22 @@ def _cached_own_pad_nets(pcb_data):
     return out
 
 
+def _exempt_rows(per_layer, layer, net_id, n_rows):
+    """_foreign_seg_exempt's mask, from a per-layer cache dict the caller has
+    JUST validated via _foreign_seg_arrays (no re-validation)."""
+    key = (layer, 'exempt', net_id)
+    hit = per_layer.get(key)
+    if hit is not None and len(hit) == n_rows:
+        return hit
+    rows, nets = per_layer.get((layer, 'giftrows'), ([], []))
+    mask = np.zeros(n_rows, dtype=bool)
+    for _i, _lift in zip(rows, nets):
+        if _i < n_rows and net_id in _lift:
+            mask[_i] = True
+    per_layer[key] = mask
+    return mask
+
+
 def _foreign_seg_exempt(pcb_data, layer, net_id, n_rows):
     """Boolean mask of foreign-array rows that are NOT foreign to `net_id`.
 
@@ -461,6 +531,69 @@ def _foreign_seg_bboxes(pcb_data, layer):
     return pcb_data._foreign_seg_arr_cache[1][(layer, 'bbox')]
 
 
+def _rust_seg_dist():
+    """grid_router.seg_foreign_min_dist when available (KICAD_RUST_RASTER!=0)."""
+    from routing_utils import _rust_raster
+    return _rust_raster('seg_foreign_min_dist')
+
+
+def _seg_foreign_seg_below(pcb_data, net_id, x1, y1, x2, y2, layer, thr,
+                           net_clearances=None, base_clearance=0.0,
+                           track_clearances=None):
+    """Exactly `_seg_foreign_seg_dist(...) < thr`, cheaper.
+
+    A foreign item j can only push the minimum below thr where some sample is
+    within thr + hw_j + excess_j of its centreline -- i.e. inside its copper
+    bbox (which already includes hw_j) grown by thr + excess_j. So the
+    candidates are the original R-window rows further narrowed to that
+    reach (never widened), and the Rust core stops at the first sample that
+    answers the question. The numpy path is the fallback."""
+    _rust = _rust_seg_dist()
+    if _rust is None:
+        return _seg_foreign_seg_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
+                                     net_clearances=net_clearances,
+                                     base_clearance=base_clearance,
+                                     track_clearances=track_clearances) < thr
+    nid, fax, fay, fbx, fby, fhw = _foreign_seg_arrays(pcb_data, layer)
+    if nid.size == 0:
+        return 1e9 < thr
+    per_layer = pcb_data._foreign_seg_arr_cache[1]
+    n = max(2, int(math.hypot(x2 - x1, y2 - y1) / 0.02) + 1)
+    R = _FOREIGN_PAD_WINDOW
+    fminx, fmaxx, fminy, fmaxy = per_layer[(layer, 'bbox')]
+    sx0, sx1 = min(x1, x2), max(x1, x2)
+    sy0, sy1 = min(y1, y2), max(y1, y2)
+    near = ((fmaxx >= sx0 - R) & (fminx <= sx1 + R) &
+            (fmaxy >= sy0 - R) & (fminy <= sy1 + R) & (nid != net_id))
+    near &= ~_exempt_rows(per_layer, layer, net_id, nid.size)
+    if not near.any():
+        return 1e9 < thr
+    excess = None
+    if net_clearances or track_clearances:
+        _nc = net_clearances or {}
+        _tc = track_clearances or {}
+        excess = np.array([max(0.0,
+                               max(_nc.get(int(f), base_clearance),
+                                   _tc.get(int(f), 0.0)) - base_clearance)
+                           for f in nid[near]], dtype=float)
+    idx = np.flatnonzero(near)
+    reach = thr + (excess if excess is not None else 0.0)
+    keep = ((fmaxx[idx] >= sx0 - reach) & (fminx[idx] <= sx1 + reach) &
+            (fmaxy[idx] >= sy0 - reach) & (fminy[idx] <= sy1 + reach))
+    if not keep.any():
+        return False
+    sel = idx[keep]
+    ex = excess[keep] if excess is not None else None
+    d = _rust(float(x1), float(y1), float(x2), float(y2), n,
+              np.ascontiguousarray(fax[sel], dtype=float),
+              np.ascontiguousarray(fay[sel], dtype=float),
+              np.ascontiguousarray(fbx[sel], dtype=float),
+              np.ascontiguousarray(fby[sel], dtype=float),
+              np.ascontiguousarray(fhw[sel], dtype=float),
+              ex, float(thr))
+    return d < thr
+
+
 def _seg_foreign_seg_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
                           net_clearances=None, base_clearance=0.0,
                           track_clearances=None):
@@ -483,18 +616,39 @@ def _seg_foreign_seg_dist(pcb_data, net_id, x1, y1, x2, y2, layer,
     seg-vs-seg ONLY, which is exactly what this helper measures, so a caller
     passing it here must NOT pass it to the pad/via helpers (KiCad's
     Type=='track' binds tracks to tracks). Inert when the map is empty."""
+    # Validate the foreign-copper cache ONCE per query: the bbox and exemption
+    # lookups below read the same, just-validated entry (they used to
+    # re-validate it twice more -- an O(segments) signature each time).
     nid, fax, fay, fbx, fby, fhw = _foreign_seg_arrays(pcb_data, layer)
     if nid.size == 0:
         return 1e9
+    per_layer = pcb_data._foreign_seg_arr_cache[1]
     n = max(2, int(math.hypot(x2 - x1, y2 - y1) / 0.02) + 1)
     R = _FOREIGN_PAD_WINDOW
-    fminx, fmaxx, fminy, fmaxy = _foreign_seg_bboxes(pcb_data, layer)
+    fminx, fmaxx, fminy, fmaxy = per_layer[(layer, 'bbox')]
     near = ((fmaxx >= min(x1, x2) - R) & (fminx <= max(x1, x2) + R) &
             (fmaxy >= min(y1, y2) - R) & (fminy <= max(y1, y2) + R) & (nid != net_id))
-    near &= ~_foreign_seg_exempt(pcb_data, layer, net_id, nid.size)
+    near &= ~_exempt_rows(per_layer, layer, net_id, nid.size)
     if not near.any():
         return 1e9
     ax, ay, bx, by, hw = fax[near], fay[near], fbx[near], fby[near], fhw[near]
+    _rust = _rust_seg_dist()
+    if _rust is not None:
+        # Bit-identical Rust port of the numpy core below (raster.rs).
+        excess = None
+        if net_clearances or track_clearances:
+            _nc = net_clearances or {}
+            _tc = track_clearances or {}
+            excess = np.array([max(0.0,
+                                   max(_nc.get(int(f), base_clearance),
+                                       _tc.get(int(f), 0.0)) - base_clearance)
+                               for f in nid[near]], dtype=float)
+        return float(_rust(float(x1), float(y1), float(x2), float(y2), n,
+                           np.ascontiguousarray(ax, dtype=float),
+                           np.ascontiguousarray(ay, dtype=float),
+                           np.ascontiguousarray(bx, dtype=float),
+                           np.ascontiguousarray(by, dtype=float),
+                           np.ascontiguousarray(hw, dtype=float), excess))
     t = np.linspace(0.0, 1.0, n + 1)
     sx = x1 + (x2 - x1) * t
     sy = y1 + (y2 - y1) * t
