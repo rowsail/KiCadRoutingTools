@@ -468,6 +468,102 @@ impl TargetHint {
     }
 }
 
+/// Margins at or above this many cells use the per-search bitmap cache for
+/// segment checks; smaller ones keep GridObstacleMap::segment_blocked.
+const WIDE_MARGIN_CELLS: f64 = 3.0;
+
+/// Per-search cache of the obstacle map's TRACK blocking (is_blocked), one
+/// bit per cell in 64x64 tiles built on first touch. A wide track (power
+/// width on a fine rescue grid: margin 29 cells measured) made every move
+/// test (2r+1)^2 cells through is_blocked's hash lookups -- ~28k per
+/// expansion, hours for one 1e7-iteration search. Here the same test reads
+/// 64-cell words, skips empty spans, and computes the exact distance only
+/// for cells that ARE blocked. Same cell set, same f64 arithmetic, same
+/// answer as GridObstacleMap::segment_blocked (the map is immutable for the
+/// duration of a search, so the cache cannot go stale).
+pub(crate) struct BlockedTiles {
+    tiles: FxHashMap<(i32, i32, usize), Box<[u64; 64]>>,
+}
+
+impl BlockedTiles {
+    pub(crate) fn new() -> Self {
+        Self { tiles: FxHashMap::default() }
+    }
+
+    #[inline]
+    fn row(&mut self, obstacles: &GridObstacleMap, tx: i32, ty: i32, layer: usize, iy: usize) -> u64 {
+        let t = self.tiles.entry((tx, ty, layer)).or_insert_with(|| {
+            let mut words = Box::new([0u64; 64]);
+            for (y, w) in words.iter_mut().enumerate() {
+                let gy = ty * 64 + y as i32;
+                let mut bits = 0u64;
+                for x in 0..64 {
+                    if obstacles.is_blocked(tx * 64 + x, gy, layer) {
+                        bits |= 1u64 << x;
+                    }
+                }
+                *w = bits;
+            }
+            words
+        });
+        t[iy]
+    }
+
+    /// Exactly GridObstacleMap::segment_blocked.
+    pub(crate) fn segment_blocked(&mut self, obstacles: &GridObstacleMap, gx1: i32, gy1: i32,
+                                  gx2: i32, gy2: i32, layer: usize, r: f64) -> bool {
+        if r <= 0.0 {
+            return obstacles.is_blocked(gx2, gy2, layer);
+        }
+        let r2 = r * r;
+        let rc = r.ceil() as i32;
+        let lo_x = gx1.min(gx2) - rc;
+        let hi_x = gx1.max(gx2) + rc;
+        let lo_y = gy1.min(gy2) - rc;
+        let hi_y = gy1.max(gy2) + rc;
+        let (ax, ay) = (gx1 as f64, gy1 as f64);
+        let dx = (gx2 - gx1) as f64;
+        let dy = (gy2 - gy1) as f64;
+        let len2 = dx * dx + dy * dy;
+        for cy in lo_y..=hi_y {
+            let ty = cy.div_euclid(64);
+            let iy = cy.rem_euclid(64) as usize;
+            let mut cx = lo_x;
+            while cx <= hi_x {
+                let tx = cx.div_euclid(64);
+                let ix0 = cx - tx * 64;
+                let seg_end = hi_x.min(tx * 64 + 63);
+                let ix1 = seg_end - tx * 64;
+                let width = (ix1 - ix0 + 1) as u32;
+                let mask = if width >= 64 { u64::MAX } else { ((1u64 << width) - 1) << ix0 };
+                let mut m = self.row(obstacles, tx, ty, layer, iy) & mask;
+                while m != 0 {
+                    let b = m.trailing_zeros() as i32;
+                    m &= m - 1;
+                    let px = (tx * 64 + b) as f64;
+                    let py = cy as f64;
+                    let d2 = if len2 <= 0.0 {
+                        let ex = px - ax;
+                        let ey = py - ay;
+                        ex * ex + ey * ey
+                    } else {
+                        let mut t = ((px - ax) * dx + (py - ay) * dy) / len2;
+                        if t < 0.0 { t = 0.0; } else if t > 1.0 { t = 1.0; }
+                        let ex = px - (ax + t * dx);
+                        let ey = py - (ay + t * dy);
+                        ex * ex + ey * ey
+                    };
+                    if d2 <= r2 {
+                        return true;
+                    }
+                }
+                cx = seg_end + 1;
+            }
+        }
+        false
+    }
+}
+
 pub(crate) struct GridSearch {
     pub(crate) open_set: BinaryHeap<OpenEntry>,
     pub(crate) store: NodeStore,
@@ -479,6 +575,8 @@ pub(crate) struct GridSearch {
     target_states: Vec<GridState>,
     target_hint: TargetHint,
     opts: SearchOptions,
+    /// Wide-margin segment-check cache (see BlockedTiles).
+    blocked_tiles: BlockedTiles,
     /// Best heuristic over the sources (RouteStats.initial_h).
     pub(crate) initial_h: i32,
     /// #529 dynamic iterations -- closest approach: minimum cost-to-go
@@ -588,6 +686,7 @@ impl GridSearch {
             target_states,
             target_hint,
             opts,
+            blocked_tiles: BlockedTiles::new(),
             initial_h,
             best_h: initial_h,
             iteration_ceiling: max_iterations, // disabled unless raised
@@ -791,9 +890,14 @@ impl GridSearch {
                 let ngx = current.gx + dx;
                 let ngy = current.gy + dy;
 
-                if obstacles.segment_blocked(current.gx, current.gy, ngx, ngy,
-                                             current.layer as usize,
-                                             self.opts.track_margin.at(current.layer as usize)) {
+                let _tm = self.opts.track_margin.at(current.layer as usize);
+                if if _tm >= WIDE_MARGIN_CELLS {
+                    self.blocked_tiles.segment_blocked(obstacles, current.gx, current.gy, ngx, ngy,
+                                                       current.layer as usize, _tm)
+                } else {
+                    obstacles.segment_blocked(current.gx, current.gy, ngx, ngy,
+                                              current.layer as usize, _tm)
+                } {
                     sink.on_blocked(ngx, ngy, current.layer);
                     continue;
                 }
@@ -987,9 +1091,14 @@ impl GridSearch {
                 }
 
                 // Check if destination layer is blocked at this position
-                if obstacles.segment_blocked(current.gx, current.gy, current.gx, current.gy,
-                                             layer as usize,
-                                             self.opts.track_margin.at(layer as usize)) {
+                let _tm = self.opts.track_margin.at(layer as usize);
+                if if _tm >= WIDE_MARGIN_CELLS {
+                    self.blocked_tiles.segment_blocked(obstacles, current.gx, current.gy,
+                                                       current.gx, current.gy, layer as usize, _tm)
+                } else {
+                    obstacles.segment_blocked(current.gx, current.gy, current.gx, current.gy,
+                                              layer as usize, _tm)
+                } {
                     sink.on_blocked(current.gx, current.gy, layer);
                     continue;
                 }
