@@ -94,7 +94,7 @@ def _fp_attrs(obj, depth=0):
                         if not _skip(k)))
 
 
-def _fingerprint(watch, rung_scoped=()):
+def _fingerprint(watch, rung_scoped=(), skip=()):
     """{entry: fingerprint} over plugin module globals and watched objects.
 
     rung_scoped: attributes every rung SETS before it reads them (so their
@@ -108,7 +108,8 @@ def _fingerprint(watch, rung_scoped=()):
             if k.startswith('__') or _skip(k) or callable(v) \
                     or type(v).__name__ == 'module':
                 continue
-            if isinstance(v, (dict, list, set, frozenset, tuple) + _SCALARS):
+            if isinstance(v, (dict, list, set, frozenset, tuple) + _SCALARS) \
+                    and f'{name}.{k}' not in skip:
                 out[f'{name}.{k}'] = _fp(v)
     for i, o in enumerate(watch):
         for k, v in vars(o).items():
@@ -121,12 +122,23 @@ def _changed(a, b):
     return sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
 
 
+def _child_setup():
+    """Worker start: no cyclic GC. A forked worker shares the parent's heap
+    copy-on-write; the GC's first full pass touches every tracked object's
+    header and so copies most of that heap (~2 GB on a routed board), which
+    made workers far slower than the parent. Workers are short-lived and
+    exit with os._exit, so they never need to collect."""
+    import gc
+    gc.disable()
+
+
 def _spawn(rung_fn, cfg, watch, rung_scoped):
     """Fork a worker for one rung. Returns (pid, read_fd)."""
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:                                   # worker
         os.close(r)
+        _child_setup()
         try:
             sys.stdout = io.StringIO()
             before = _fingerprint(watch, rung_scoped)
@@ -260,3 +272,151 @@ if os.environ.get('KICAD_RESCUE_PARALLEL_DEBUG'):
     import atexit
     atexit.register(lambda: print(f"[rescue_parallel] {dict(sorted(_STATS.items()))}",
                                   file=sys.stderr))
+
+
+# --- Speculative single calls -------------------------------------------------
+
+# Record writers a speculative call may hit. They only append to the
+# fab-tier ledger (read solely by the end-of-run summary) and print, deduped,
+# and both return None. A worker records each call instead of making it and
+# leaves a marker in its captured stdout; the parent makes the REAL calls at
+# those markers while replaying the output, so ledger order, dedupe and
+# printing are exactly what a serial run produces -- even when the parent
+# itself logged escalations after the fork (the dogbone tap usually does).
+_RECORDERS = ('warn_fab_escalation', 'note_narrowing')
+_MARK = '\x00RPL%d\x00'
+_MARK_RE = None
+# The records those writers keep: they may differ between the fork and the
+# take, which is fine (the replay applies on the parent's own state).
+_RECORDS = ('fab_tiers._LEDGER', 'fab_tiers._escalation_warned',
+            'fab_tiers._escalation_lever_said')
+
+
+def _intercept_recorders(events):
+    """In a worker: route every module's reference to the recorder functions
+    to a stub that logs the call and marks its place in stdout."""
+    import fab_tiers
+    for rname in _RECORDERS:
+        orig = getattr(fab_tiers, rname)
+
+        def stub(*a, _n=rname, **k):
+            sys.stdout.write(_MARK % len(events))
+            events.append((_n, a, k))
+        for mod in list(sys.modules.values()):
+            d = getattr(mod, '__dict__', None)
+            if not d:
+                continue
+            for attr, val in list(d.items()):
+                if val is orig:
+                    setattr(mod, attr, stub)
+
+
+def _replay_output(out, events):
+    """Print a worker's captured stdout, making the recorded calls for real
+    at their markers."""
+    global _MARK_RE
+    import re
+    import fab_tiers
+    if _MARK_RE is None:
+        _MARK_RE = re.compile('\x00RPL(\\d+)\x00')
+    pos = 0
+    for m in _MARK_RE.finditer(out):
+        sys.stdout.write(out[pos:m.start()])
+        name, a, k = events[int(m.group(1))]
+        getattr(fab_tiers, name)(*a, **k)
+        pos = m.end()
+    sys.stdout.write(out[pos:])
+
+
+class _Speculation:
+    """A call running ahead in a forked worker (see speculate)."""
+
+    def __init__(self, pid, fd, before, watch, ignore):
+        self.pid, self.fd = pid, fd
+        self.before, self.watch, self.ignore = before, watch, ignore
+
+    def take(self):
+        """The worker's return value if it is valid HERE, else None.
+
+        Valid = the worker's call changed no observable state AND the state
+        now equals the state it was forked from (everything the caller did
+        in the meantime left no trace). Then the call, made now, would return
+        exactly this; its captured stdout is printed so the log reads the
+        same. Otherwise the caller must make the call itself."""
+        if self.pid is None:
+            return None
+        _t = time.perf_counter()
+        msg = _collect(self.pid, self.fd)
+        _time('spec_wait', _t)
+        self.pid = None
+        if msg[0] != 'ok' or not msg[2]:
+            _stat('spec_dirty' if msg[0] == 'ok' else 'spec_error')
+            if os.environ.get('KICAD_RESCUE_PARALLEL_DEBUG') == '2':
+                print(f"[rescue_parallel] speculation unusable: "
+                      f"{msg[4] if msg[0] == 'ok' else msg[1]}", file=sys.stderr)
+            return None
+        _moved = _changed(self.before, _fingerprint(self.watch, self.ignore,
+                                                    _RECORDS))
+        if _moved:
+            # Something the call depends on moved since the fork: not valid.
+            _stat('spec_stale')
+            if os.environ.get('KICAD_RESCUE_PARALLEL_DEBUG') == '2':
+                print(f"[rescue_parallel] speculation stale: {_moved}",
+                      file=sys.stderr)
+            return None
+        _stat('spec_used')
+        _replay_output(msg[3], msg[5])
+        return msg[1]
+
+    def cancel(self):
+        if self.pid is not None:
+            _kill([(self.pid, self.fd)])
+            self.pid = None
+
+
+def _spawn_call(fn, watch, ignore):
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:                                   # worker
+        os.close(r)
+        _child_setup()
+        try:
+            sys.stdout = io.StringIO()
+            events = []
+            _intercept_recorders(events)
+            before = _fingerprint(watch, ignore)
+            value = fn()
+            changed = _changed(before, _fingerprint(watch, ignore))
+            msg = ('ok', value, not changed, sys.stdout.getvalue(), changed,
+                   events)
+            data = pickle.dumps(msg)
+        except BaseException as e:                 # noqa: BLE001
+            data = pickle.dumps(('error', repr(e)))
+        try:
+            with os.fdopen(w, 'wb') as fh:
+                fh.write(data)
+        finally:
+            os._exit(0)
+    os.close(w)
+    return pid, r
+
+
+def speculate(fn, watch=(), ignore=()):
+    """Start fn() in a forked worker from the CURRENT state, so a later call
+    the caller may need can run while it does other work. Returns a handle
+    whose take() yields fn's (picklable) return value only when that is
+    exactly what calling fn() at that point would return; None when forking
+    is not allowed (inside KiCad, KICAD_RESCUE_PARALLEL=0). `ignore` names
+    watched-object attributes the caller sets identically around the real
+    call (they are not state the call depends on)."""
+    if _workers_allowed() < 1:
+        return None
+    sys.stdout.flush()
+    sys.stderr.flush()
+    import fab_tiers                     # pure definitions; safe to pre-import
+    _t = time.perf_counter()
+    before = _fingerprint(watch, ignore, _RECORDS)
+    _t = _time('spec_fingerprint', _t)
+    pid, fd = _spawn_call(fn, watch, ignore)
+    _time('spec_fork', _t)
+    return _Speculation(pid, fd, before, watch, ignore)

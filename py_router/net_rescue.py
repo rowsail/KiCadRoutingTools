@@ -310,6 +310,34 @@ _BUILD_RECORDS = ('_net_tie_lift', '_net_tie_price',
                   '_graphic_own_pad_lift', '_graphic_own_pad_via_lift')
 
 
+# Attributes the bare-pad escape sets identically around each fanout call it
+# makes, so a speculative call's fingerprint must not count them.
+_FANOUT_SPEC_IGNORE = ('_fanout_all_foreign_immovable',)
+
+
+def _rescue_fanout(fp, pcb_data, net_name, config, immovable):
+    """The bare-pad escape's generate_bga_fanout call, exactly as its two
+    call sites make it: (tracks, vias). immovable=True is the strict
+    attempt, run with every foreign passive immovable (the flag is restored
+    afterwards, as at the call site); False is the permissive retry."""
+    from bga_fanout import generate_bga_fanout
+    kwargs = dict(net_filter=[net_name], layers=list(config.layers),
+                  track_width=config.track_width, clearance=config.clearance,
+                  via_size=config.via_size, via_drill=config.via_drill,
+                  escape_method='dogbone',
+                  layer_costs=getattr(config, 'layer_costs', None),
+                  plane_drop='off')
+    if not immovable:
+        _ft, _fv, *_ = generate_bga_fanout(fp, pcb_data, **kwargs)
+        return _ft, _fv
+    pcb_data._fanout_all_foreign_immovable = True
+    try:
+        _ft, _fv, *_ = generate_bga_fanout(fp, pcb_data, **kwargs)
+    finally:
+        pcb_data._fanout_all_foreign_immovable = False
+    return _ft, _fv
+
+
 def _pristine_rescue_map(board, parent_pcb, cfg, net_id, net_clearances,
                          scope_key):
     """Per-board LRU of PRISTINE rescue obstacle maps (2026-08-14 profiling:
@@ -909,7 +937,14 @@ def rescue_failed_nets(state, single_ended_nets, net_clearances=None,
             except Exception:
                 _off_board = None
             _tapped = 0
+            _open_specs = []
+
+            def _cancel_specs():
+                for _sp in _open_specs:
+                    _sp.cancel()
+                _open_specs.clear()
             for _pad in pcb_data.pads_by_net.get(net_id, []):
+                _cancel_specs()   # anything the previous pad didn't use
                 if _tapped >= 4:
                     break
                 if _pad.drill and _pad.drill > 0:
@@ -935,6 +970,26 @@ def rescue_failed_nets(state, single_ended_nets, net_clearances=None,
                 if not _bare:
                     continue
                 _cu = [l for l in _pad.layers if l.endswith('.Cu')]
+                # The strict and permissive fanout calls below run only once
+                # the tap (and then the strict call) have failed, from the
+                # same state. Start them now in forked workers (CLI only);
+                # each answer is used only if that state is still untouched
+                # when its call is reached -- see rescue_parallel.speculate.
+                _spec_strict = _spec_perm = None
+                _fp0 = pcb_data.footprints.get(_pad.component_ref)
+                if _fp0 is not None and len(_fp0.pads) >= 12:
+                    from rescue_parallel import speculate
+                    _spec_strict = speculate(
+                        lambda: _rescue_fanout(_fp0, pcb_data, net_name,
+                                               config, True),
+                        (pcb_data,), _FANOUT_SPEC_IGNORE)
+                    if env_knobs.RESCUE_CAP_MOVE:
+                        _spec_perm = speculate(
+                            lambda: _rescue_fanout(_fp0, pcb_data, net_name,
+                                                   config, False),
+                            (pcb_data,), _FANOUT_SPEC_IGNORE)
+                    _open_specs.extend(
+                        x for x in (_spec_strict, _spec_perm) if x)
                 try:
                     _tr = tap_pad_with_escalation(
                         _pad, _cu[0] if _cu else None, net_id, pcb_data,
@@ -965,18 +1020,24 @@ def rescue_failed_nets(state, single_ended_nets, net_clearances=None,
                             # immovable_foreign_pads).
                             pcb_data._fanout_all_foreign_immovable = True
                             try:
-                                _ft, _fv, *_ = generate_bga_fanout(
-                                    _fp, pcb_data, net_filter=[net_name],
-                                    layers=list(config.layers),
-                                    track_width=config.track_width,
-                                    clearance=config.clearance,
-                                    via_size=config.via_size,
-                                    via_drill=config.via_drill,
-                                    escape_method='dogbone',
-                                    layer_costs=getattr(config,
-                                                        'layer_costs',
-                                                        None),
-                                    plane_drop='off')
+                                _sv = (_spec_strict.take()
+                                       if _spec_strict is not None
+                                       and _fp is _fp0 else None)
+                                if _sv is not None:
+                                    _ft, _fv = _sv
+                                else:
+                                    _ft, _fv, *_ = generate_bga_fanout(
+                                        _fp, pcb_data, net_filter=[net_name],
+                                        layers=list(config.layers),
+                                        track_width=config.track_width,
+                                        clearance=config.clearance,
+                                        via_size=config.via_size,
+                                        via_drill=config.via_drill,
+                                        escape_method='dogbone',
+                                        layer_costs=getattr(config,
+                                                            'layer_costs',
+                                                            None),
+                                        plane_drop='off')
                             finally:
                                 pcb_data._fanout_all_foreign_immovable = \
                                     False
@@ -1002,17 +1063,23 @@ def rescue_failed_nets(state, single_ended_nets, net_clearances=None,
                         if not _got_own \
                                 and env_knobs.RESCUE_CAP_MOVE:
                             try:
-                                _ft, _fv, *_ = generate_bga_fanout(
-                                    _fp, pcb_data, net_filter=[net_name],
-                                    layers=list(config.layers),
-                                    track_width=config.track_width,
-                                    clearance=config.clearance,
-                                    via_size=config.via_size,
-                                    via_drill=config.via_drill,
-                                    escape_method='dogbone',
-                                    layer_costs=getattr(
-                                        config, 'layer_costs', None),
-                                    plane_drop='off')
+                                _sv = (_spec_perm.take()
+                                       if _spec_perm is not None
+                                       and _fp is _fp0 else None)
+                                if _sv is not None:
+                                    _ft, _fv = _sv
+                                else:
+                                    _ft, _fv, *_ = generate_bga_fanout(
+                                        _fp, pcb_data, net_filter=[net_name],
+                                        layers=list(config.layers),
+                                        track_width=config.track_width,
+                                        clearance=config.clearance,
+                                        via_size=config.via_size,
+                                        via_drill=config.via_drill,
+                                        escape_method='dogbone',
+                                        layer_costs=getattr(
+                                            config, 'layer_costs', None),
+                                        plane_drop='off')
                             except Exception:
                                 _ft, _fv = [], []
                             if _ft or _fv:
@@ -1189,6 +1256,7 @@ def rescue_failed_nets(state, single_ended_nets, net_clearances=None,
                 print(f"    bare-ball escape: {_pad.component_ref}."
                       f"{_pad.pad_number} dogbone ({len(_tsegs)} seg(s), "
                       f"{len(_tvias)} via(s)) (#666)")
+            _cancel_specs()
             if tap_results:
                 num0, comp_points, comp_pads = _net_component_info(
                     pcb_data, net_id)
