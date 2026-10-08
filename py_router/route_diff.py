@@ -251,7 +251,7 @@ def batch_route_diff_pairs(input_file: str, output_file: str, net_names: List[st
                 via_cost: int = defaults.VIA_COST,
                 max_iterations: int = defaults.MAX_ITERATIONS,
                 max_probe_iterations: int = defaults.MAX_PROBE_ITERATIONS,
-                heuristic_weight: float = defaults.HEURISTIC_WEIGHT,
+                heuristic_weight: float = defaults.DIFF_PAIR_HEURISTIC_WEIGHT,
                 turn_cost: int = defaults.TURN_COST,
                 direction_preference_cost: int = defaults.DIRECTION_PREFERENCE_COST,
                 bus_enabled: bool = False,
@@ -678,6 +678,15 @@ def batch_route_diff_pairs(input_file: str, output_file: str, net_names: List[st
     if layer_widths:
         config_kwargs['layer_widths'] = layer_widths
         config_kwargs['impedance_target'] = impedance
+        # The pair PITCH (centre-to-centre = track_width + gap, used by every
+        # pose/offset computation) must be taken at the width actually drawn.
+        # Left at the nominal --track-width (e.g. 0.127) while F.Cu draws the
+        # 0.166 impedance width, the real P/N gap shrank to 0.091 < clearance
+        # and the #318 partner neck narrowed one member to 0.0996 (USB D+ vs
+        # D- at different widths). Use the widest layer width: narrower layers
+        # then run a slightly wider gap, never a sub-clearance one.
+        config_kwargs['track_width'] = max([config_kwargs.get('track_width') or 0.0]
+                                           + list(layer_widths.values()))
     config_kwargs['layer_costs'] = layer_costs  # per-layer bias for coupled diff routing (#193)
     # #156: the diff engine keeps the mm-exact obstacle maps (per-layer
     # impedance width baked into every stamp) -- the pose router has no
@@ -1998,8 +2007,8 @@ Examples:
                         help="Max A* iterations before giving up (default: 200000)")
     parser.add_argument("--max-probe-iterations", type=int, default=defaults.MAX_PROBE_ITERATIONS,
                         help="Max iterations for quick probe phase per direction (default: 5000)")
-    parser.add_argument("--heuristic-weight", type=float, default=defaults.HEURISTIC_WEIGHT,
-                        help=f"A* heuristic weight, higher=faster but less optimal (default: {defaults.HEURISTIC_WEIGHT})")
+    parser.add_argument("--heuristic-weight", type=float, default=defaults.DIFF_PAIR_HEURISTIC_WEIGHT,
+                        help=f"A* heuristic weight, higher=faster but less optimal (default: {defaults.DIFF_PAIR_HEURISTIC_WEIGHT})")
     parser.add_argument("--proximity-heuristic-factor", type=float,
                         default=defaults.PROXIMITY_HEURISTIC_FACTOR,
                         help=f"Factor for proximity-aware A* heuristic (default: {defaults.PROXIMITY_HEURISTIC_FACTOR}, 0=disabled)")

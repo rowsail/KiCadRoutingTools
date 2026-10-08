@@ -52,7 +52,8 @@ UNBLOCK_REFIT_MARGIN_MM = 0.05  # mm (absolute; NOT a fraction like check_drc's 
 # Cost parameters
 VIA_COST = 75  # 50 -> 75: #586 corpus (via75: -8 verdict, DRC -13, and composes with hw 2.3)
 VIA_PROXIMITY_COST = 10
-TURN_COST = 1000
+TURN_COST = 3000  # local: 1000 -> 3000, fewer needless bends (EssentialsV2 -16% extra legs at 100%; PSR3 7 -> 3 unconnected)
+# was: TURN_COST = 1000
 STUB_PROXIMITY_COST = 0.2
 TRACK_PROXIMITY_COST = 0.0
 
@@ -116,6 +117,11 @@ STITCH_PITCH = 20.0  # mm
 
 # Algorithm parameters
 MAX_ITERATIONS = 200000
+# Local: diff pairs search at 1.3. At 2.3 the pose search accepts paths up to
+# 2.3x the best cost; EssentialsV2's USB pair zig-zagged 77 mm through a pad
+# channel instead of running 63 mm straight (same run time at 1.3). Single-ended
+# routing keeps 2.3: on PSR3, 1.3 with turn cost 3000 left 11 unconnected vs 7.
+DIFF_PAIR_HEURISTIC_WEIGHT = 1.3
 HEURISTIC_WEIGHT = 2.3  # 1.9 -> 2.3: #586 corpus dose-response peak (-30 verdict, DRC -67, cpu/mem ~0.85x; 1.7 and 2.5 both worse)
 PROXIMITY_HEURISTIC_FACTOR = 0.02  # restored from 0 (1af3096): "quality-neutral"
 # was measured on a CLI that never applied it -- route.py's argparse still passed an

@@ -1022,8 +1022,11 @@ class DifferentialTab(wx.Panel):
                 direction_order=config.get('direction'),
                 disable_bga_zones=config.get('no_bga_zones'),
                 max_probe_iterations=config.get('max_probe_iterations', 5000),
-                heuristic_weight=config.get('heuristic_weight', defaults.HEURISTIC_WEIGHT),
-                turn_cost=config.get('turn_cost', 1000),
+                # Local: diff pairs use their own (lower) heuristic weight, not
+                # the shared single-ended spin box -- see DIFF_PAIR_HEURISTIC_WEIGHT.
+                heuristic_weight=config.get('diff_heuristic_weight',
+                                            defaults.DIFF_PAIR_HEURISTIC_WEIGHT),
+                turn_cost=config.get('turn_cost', defaults.TURN_COST),
                 direction_preference_cost=config.get(
                     'direction_preference_cost', defaults.DIRECTION_PREFERENCE_COST),
                 max_rip_up_count=config.get('max_ripup', defaults.MAX_RIPUP),
