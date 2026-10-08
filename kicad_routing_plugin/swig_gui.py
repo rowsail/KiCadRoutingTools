@@ -1591,6 +1591,39 @@ class RoutingDialog(wx.Dialog):
             "--relax-drc-severities; the previous values are kept in the project.")
         options_inner.Add(self.relax_drc_severities_check, 0, wx.ALL, 3)
 
+        # Local addition: grow vias that sit inside small pads after routing
+        # (py_router/pad_via_upsize.py) to cut the number of tiny drills.
+        self.upsize_pad_vias_check = wx.CheckBox(
+            options_scroll, label="Grow vias in small pads after routing")
+        self.upsize_pad_vias_check.SetValue(False)
+        self.upsize_pad_vias_check.SetToolTip(
+            "After this routing run, every via that sits inside a pad no larger than "
+            "'max pad' is grown: first its diameter, as far as it stays inside the pad "
+            "copper, then its drill, keeping Board Setup's minimum annular ring. Each "
+            "step is checked against KiCad's own shapes for clearance on every layer, "
+            "copper-to-hole clearance and hole-to-hole spacing; zones are refilled "
+            "afterwards. Fewer small drills means a cheaper board. Best on the LAST "
+            "routing step, since bigger vias leave less room for later routing.")
+        options_inner.Add(self.upsize_pad_vias_check, 0, wx.ALL, 3)
+        _uv = wx.BoxSizer(wx.HORIZONTAL)
+        _uv.Add(wx.StaticText(options_scroll, label="  max pad (mm)"), 0,
+                wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.upsize_max_pad = wx.SpinCtrlDouble(options_scroll, min=0.5, max=10.0,
+                                                initial=3.0, inc=0.5)
+        self.upsize_max_pad.SetDigits(1)
+        self.upsize_max_pad.SetToolTip("Only pads whose largest dimension is at most this.")
+        _uv.Add(self.upsize_max_pad, 0, wx.RIGHT, 8)
+        _uv.Add(wx.StaticText(options_scroll, label="max drill (mm, 0 = no cap)"), 0,
+                wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.upsize_max_drill = wx.SpinCtrlDouble(options_scroll, min=0.0, max=3.0,
+                                                  initial=0.0, inc=0.05)
+        self.upsize_max_drill.SetDigits(2)
+        self.upsize_max_drill.SetToolTip(
+            "Largest drill the pass may grow to. Big holes in pads must be filled and "
+            "capped, which costs more; 0 grows as far as the annular ring allows.")
+        _uv.Add(self.upsize_max_drill, 0)
+        options_inner.Add(_uv, 0, wx.ALL, 3)
+
         gpu_label = wx.StaticText(options_scroll, label="GPU:")
         gpu_label.SetFont(gpu_label.GetFont().Bold())
         options_inner.Add(gpu_label, 0, wx.LEFT | wx.TOP, 3)
@@ -2797,6 +2830,9 @@ class RoutingDialog(wx.Dialog):
         self.relax_drc_severities_check.SetValue(False)
         self.gpu_plan_check.SetValue(False)
         self.gpu_search_check.SetValue(self.gpu_search_check.IsEnabled())
+        self.upsize_pad_vias_check.SetValue(False)
+        self.upsize_max_pad.SetValue(3.0)
+        self.upsize_max_drill.SetValue(0.0)
         # #857/#530: the CLI defaults, from the one place they live.
         self.fab_tier.SetStringSelection(defaults.FAB_TIER)
         self.escalation.SetStringSelection(defaults.ESCALATION)
@@ -3187,6 +3223,9 @@ class RoutingDialog(wx.Dialog):
             'relax_drc_severities': self.relax_drc_severities_check.GetValue(),
             'gpu_plan': self.gpu_plan_check.GetValue(),
             'gpu_search': self.gpu_search_check.GetValue(),
+            'upsize_pad_vias': self.upsize_pad_vias_check.GetValue(),
+            'upsize_max_pad': self.upsize_max_pad.GetValue(),
+            'upsize_max_drill': self.upsize_max_drill.GetValue(),
             'clamp_netclasses': self._ceiling_on(),
             # Guide corridor (issue #7)
             'guide_corridor_enabled': self.guide_corridor_check.GetValue(),
@@ -4175,6 +4214,27 @@ class RoutingDialog(wx.Dialog):
                         print(f"    {_c}")
             except Exception as e:
                 print(f"(skipped DRC-settings write-back: {e})")
+
+        # Local addition: grow vias in small pads (pad_via_upsize.py), then
+        # refill so the pours clear the larger barrels.
+        # Not gated on `successful`: a last step that finds everything already
+        # connected must still grow the vias.
+        if config.get('upsize_pad_vias'):
+            try:
+                self._apply_status("Growing vias in small pads...")
+                from pad_via_upsize import upsize_pad_vias
+                _md = config.get('upsize_max_drill') or None
+                _us = upsize_pad_vias(board, max_pad_mm=config.get('upsize_max_pad') or 3.0,
+                                      max_drill_mm=_md)
+                print(f"Vias in small pads: {_us['candidates']} found, {_us['grown']} grown"
+                      + "".join(f"\n    {n:4d} x {k}" for k, n in
+                                sorted(_us['by_size'].items(), key=lambda kv: -kv[1])))
+                if _us['grown']:
+                    board.SetModified()
+                    from .gui_utils import refill_all_zones
+                    refill_all_zones(board)
+            except Exception as e:
+                print(f"(via growth skipped: {e})")
 
         # #521: persist this run's protection-worthy nets (matched groups) and
         # impedance declarations, engine-noted during batch_route. The diff tab

@@ -294,6 +294,7 @@ _PARAM_CONTROL_ALIASES = {
     # GPU global plan option (Options tab; CLI --gpu-plan).
     'gpu_plan': 'gpu_plan_check',
     'gpu_search': 'gpu_search_check',
+    'upsize_pad_vias': 'upsize_pad_vias_check',
 }
 # _PARAM_SPECIAL: params handled by _apply_special() (composite / inverted /
 # panel-backed controls that a plain SetValue can't fill).

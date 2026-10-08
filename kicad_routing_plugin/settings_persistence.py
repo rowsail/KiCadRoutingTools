@@ -53,6 +53,9 @@ def get_dialog_settings(dialog):
         'relax_drc_severities': dialog.relax_drc_severities_check.GetValue(),
         'gpu_plan': dialog.gpu_plan_check.GetValue(),
         'gpu_search': dialog.gpu_search_check.GetValue(),
+        'upsize_pad_vias': dialog.upsize_pad_vias_check.GetValue(),
+        'upsize_max_pad': dialog.upsize_max_pad.GetValue(),
+        'upsize_max_drill': dialog.upsize_max_drill.GetValue(),
         'power_nets': dialog.power_nets_ctrl.GetValue(),
         'power_widths': dialog.power_widths_ctrl.GetValue(),
         'no_bga_zones': dialog.no_bga_zones_ctrl.GetValue(),
@@ -357,6 +360,12 @@ def restore_dialog_settings(dialog, settings):
         dialog.gpu_plan_check.SetValue(bool(settings['gpu_plan']))
     if 'gpu_search' in settings and dialog.gpu_search_check.IsEnabled():
         dialog.gpu_search_check.SetValue(bool(settings['gpu_search']))
+    if 'upsize_pad_vias' in settings:
+        dialog.upsize_pad_vias_check.SetValue(bool(settings['upsize_pad_vias']))
+    if 'upsize_max_pad' in settings:
+        dialog.upsize_max_pad.SetValue(float(settings['upsize_max_pad']))
+    if 'upsize_max_drill' in settings:
+        dialog.upsize_max_drill.SetValue(float(settings['upsize_max_drill']))
     if 'power_nets' in settings:
         dialog.power_nets_ctrl.SetValue(settings['power_nets'])
     if 'power_widths' in settings:
