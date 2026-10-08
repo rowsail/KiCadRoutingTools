@@ -1,33 +1,59 @@
-"""Redundant leaf-copper pruning: the end-of-run tidy for dead-end copper the
-dead-end sweep keeps.
+"""Redundant copper pruning: the end-of-run tidy for copper the dead-end
+sweep keeps.
 
-sweep_dead_ends treats a via at a track end as an anchor, so a track that
-ends on a via joining nothing else ships (KiCad: via_dangling), and it never
-looks at plane nets' redundant links -- a pin already dropped to its plane by
-one via whose trace then carries on to a SECOND via on the same plane.
+Every removal is kept only when the authoritative zone-aware connectivity
+check grades the net no worse (still connected if it was, no more stranded
+pins, no more components).
 
-This pass removes LEAF items -- a track with an end touching no other
-same-net copper, pad or via; a via touching at most one same-net track and
-no same-net pad -- one at a time, keeping a removal only when the
-authoritative zone-aware connectivity check grades the net no worse (still
-connected if it was, no more stranded pads, no more components). Repeated
-until nothing changes, so a pad -> via -> trace -> via chain on a plane net
-unwinds from the far via inward and stops at the first via the pad needs.
+Junk -- removed on ANY net, finished or not (never a landing site):
+  * a duplicate via (barrels overlapping a same-net via) and any sliver
+    lying inside the pair's barrels;
+  * a duplicate segment (same layer, same two endpoints);
+  * a sliver lying wholly inside one via's barrel;
+  * a track whose end lies inside a same-net pin that has NO copper on the
+    track's layer, with nothing else at that end -- aimed at a pin on
+    another layer, it connects to nothing there.
 
-Protected (unfinished) nets are skipped -- their dead ends are the landing
-sites the reconciliation retries from, exactly as for the sweep -- and so are
-locked copper and footprint graphics. Removed copper is split by origin like
-sweep_dead_ends: this run's copper is dropped from the write-lists, input-file
-copper is returned for the writer / GUI applier to strip, and pcb_data is
-updated to the board that will be written (#319 mutation contract).
+Finished nets without pours -- LEAF items:
+  * a via joining no layers (copper reaches it on at most one layer --
+    KiCad's via_dangling) or touching at most one track and no pin;
+  * a track with an end touching no other same-net track, via, or pin on
+    the track's layer.
+
+Finished plane (pour) nets -- deliberately narrow (a general leaf rule
+measured 136 GND stitching vias "redundant" through the pours):
+  * a trace run between two vias (plain bends only): the pin is already on
+    the plane, the trace carries on to another via. If one via has no other
+    connection, the run AND that via go (chains unwind from the far end);
+    if both vias connect onward (the far via also serves a pin), only the
+    run goes;
+  * a track with an end touching nothing; an end inside the net's own pour
+    counts as touching only when the stub starts at a pin (a deliberate fat
+    pin-to-pour connection).
+  Stitching vias and a pin's own via are never candidates.
+
+Unfinished (protected) nets keep their dead ends -- the landing sites the
+reconciliation retries from -- and locked copper and footprint graphics are
+never touched. Removed copper is split by origin like sweep_dead_ends (this
+run's copper leaves the write-lists, input-file copper is returned for the
+writer / GUI applier to strip) and pcb_data is updated (#319).
+
+Performance: one spatial index per net answers every "what reaches this
+point" query from a single cell; removals are applied in rounds (units near
+a removal wait for the next round, so chains still unwind from the far end),
+and units the connectivity check refused are not retried unless something
+nearby changed.
 """
 
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from typing import List, Tuple
 
 _EPS = 1e-6
+_CELL = 0.5          # spatial-index cell (mm)
+_STALE_R = 2.0       # units this close to a removal wait for the next round
 
 
 def _pt_seg(px, py, s) -> float:
@@ -38,248 +64,445 @@ def _pt_seg(px, py, s) -> float:
     return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
 
 
-def _pad_pts(pads):
-    out = []
-    for p in pads:
-        if getattr(p, 'pad_type', '') == 'np_thru_hole':
-            continue
-        px = getattr(p, 'global_x', getattr(p, 'x', 0.0))
-        py = getattr(p, 'global_y', getattr(p, 'y', 0.0))
-        r = max(getattr(p, 'size_x', 0.5), getattr(p, 'size_y', 0.5)) / 2.0
-        out.append((px, py, r))
-    return out
+def _vr(v) -> float:
+    return (getattr(v, 'size', 0.0) or 0.0) / 2.0
 
 
-def _leaf_candidates(segs, vias, pad_pts, single_layer_vias=()):
-    """(kind, obj) for leaf items, vias first, in a deterministic order.
-    A via is a candidate when it touches at most one same-net track and no
-    pad, OR when same-net copper reaches it on at most one layer
-    (``single_layer_vias``: KiCad's via_dangling -- it joins no layers, e.g.
-    tracks meeting on one layer, or a via in a single-layer SMD pad)."""
-    cands = []
-    single = {id(v) for v in single_layer_vias}
-    for v in vias:
-        if id(v) in single:
-            cands.append(('via', v))
-            continue
-        vr = (getattr(v, 'size', 0.0) or 0.0) / 2.0
-        if any(math.hypot(v.x - px, v.y - py) < r + vr for px, py, r in pad_pts):
-            continue
-        n = sum(1 for s in segs if _pt_seg(v.x, v.y, s) < vr + s.width / 2.0 - _EPS)
-        if n <= 1:
-            cands.append(('via', v))
-    for s in segs:
-        free = False
-        for ex, ey in ((s.start_x, s.start_y), (s.end_x, s.end_y)):
-            on = (any(t is not s and _pt_seg(ex, ey, t) < t.width / 2.0 + _EPS for t in segs)
-                  or any(math.hypot(ex - v.x, ey - v.y) < (getattr(v, 'size', 0.0) or 0.0) / 2.0 + _EPS
-                         for v in vias)
-                  or any(math.hypot(ex - px, ey - py) < r + _EPS for px, py, r in pad_pts))
-            if not on:
-                free = True
-                break
-        if free:
-            cands.append(('seg', s))
-    cands.sort(key=lambda kv: (0 if kv[0] == 'via' else 1,
-                               round(getattr(kv[1], 'x', getattr(kv[1], 'start_x', 0.0)), 4),
-                               round(getattr(kv[1], 'y', getattr(kv[1], 'start_y', 0.0)), 4)))
-    return cands
+class _NetGeom:
+    """Spatial index of one net's live tracks / vias / pins."""
+
+    def __init__(self, segs, vias, pads, zones):
+        self.segs = list(segs)
+        self.vias = list(vias)
+        self.alive = set(id(o) for o in self.segs) | set(id(o) for o in self.vias)
+        self.zones = zones
+        self.sgrid = defaultdict(list)
+        self.vgrid = defaultdict(list)
+        for s in self.segs:
+            r = s.width / 2.0 + _EPS
+            for c in self._cells(min(s.start_x, s.end_x) - r, min(s.start_y, s.end_y) - r,
+                                 max(s.start_x, s.end_x) + r, max(s.start_y, s.end_y) + r):
+                self.sgrid[c].append(s)
+        for v in self.vias:
+            r = _vr(v) + _EPS
+            for c in self._cells(v.x - r, v.y - r, v.x + r, v.y + r):
+                self.vgrid[c].append(v)
+        # pins: (x, y, r, layers|None, half_x, half_y, cos, sin)
+        self.pins = []
+        for p in pads:
+            if getattr(p, 'pad_type', '') == 'np_thru_hole':
+                continue
+            pl = list(getattr(p, 'layers', None) or [])
+            lay = None if ((getattr(p, 'drill', 0) or 0) > 0 or any('*' in L for L in pl)) \
+                else {L for L in pl if L.endswith('.Cu')}
+            rot = math.radians(getattr(p, 'rect_rotation', 0.0) or 0.0)
+            hx, hy = getattr(p, 'size_x', 0.5) / 2.0, getattr(p, 'size_y', 0.5) / 2.0
+            self.pins.append((getattr(p, 'global_x', 0.0), getattr(p, 'global_y', 0.0),
+                              max(hx, hy), lay, hx, hy, math.cos(rot), math.sin(rot)))
+
+    @staticmethod
+    def _cells(x0, y0, x1, y1):
+        for cx in range(int(math.floor(x0 / _CELL)), int(math.floor(x1 / _CELL)) + 1):
+            for cy in range(int(math.floor(y0 / _CELL)), int(math.floor(y1 / _CELL)) + 1):
+                yield (cx, cy)
+
+    @staticmethod
+    def _key(x, y):
+        return (int(math.floor(x / _CELL)), int(math.floor(y / _CELL)))
+
+    def remove(self, o):
+        self.alive.discard(id(o))
+
+    def restore(self, o):
+        self.alive.add(id(o))
+
+    def live(self, o):
+        return id(o) in self.alive
+
+    def segs_reaching(self, x, y, layer=None):
+        return [t for t in self.sgrid.get(self._key(x, y), ())
+                if id(t) in self.alive and (layer is None or t.layer == layer)
+                and _pt_seg(x, y, t) < t.width / 2.0 + _EPS]
+
+    def vias_at(self, x, y, skip=None):
+        return [w for w in self.vgrid.get(self._key(x, y), ())
+                if id(w) in self.alive and w is not skip and math.hypot(w.x - x, w.y - y) < _vr(w) + _EPS]
+
+    def via_tracks(self, v):
+        r = _vr(v)
+        out, seen = [], set()
+        for c in self._cells(v.x - r, v.y - r, v.x + r, v.y + r):
+            for t in self.sgrid.get(c, ()):
+                if id(t) in self.alive and id(t) not in seen and _pt_seg(v.x, v.y, t) < r + t.width / 2.0 - _EPS:
+                    seen.add(id(t))
+                    out.append(t)
+        return out
+
+    def touchers(self, x, ex, ey, ox, oy, same_layer=False):
+        """Other tracks reaching end (ex, ey) of x, excluding those that also
+        reach x's other end (ox, oy) -- on a sliver shorter than a track
+        half-width the neighbour joined at the other end covers this end too."""
+        return [t for t in self.segs_reaching(ex, ey, x.layer if same_layer else None)
+                if t is not x and not _pt_seg(ox, oy, t) < t.width / 2.0 + _EPS]
+
+    def end_on_pin(self, x, y, layer):
+        return any(math.hypot(x - px, y - py) < r + _EPS and (lay is None or layer in lay)
+                   for px, py, r, lay, *_ in self.pins)
+
+    def via_in_pin(self, v):
+        r = _vr(v)
+        return any(math.hypot(v.x - px, v.y - py) < pr + r for px, py, pr, *_ in self.pins)
+
+    def pin_dist(self, v):
+        return min((math.hypot(v.x - p[0], v.y - p[1]) for p in self.pins), default=0.0)
+
+    def over_wrong_layer_pin(self, x, y, layer):
+        for px, py, _r, lay, hx, hy, c, sn in self.pins:
+            if lay is None or layer in lay:
+                continue
+            dx, dy = x - px, y - py
+            if abs(dx * c + dy * sn) <= hx + _EPS and abs(-dx * sn + dy * c) <= hy + _EPS:
+                return True
+        return False
+
+    def in_pour(self, x, y, layer):
+        from check_connected import point_in_polygon
+        return any(z.layer == layer and point_in_polygon(x, y, z.polygon) for z in self.zones)
+
+    def support_layers(self, v, copper_layers):
+        """Layers same-net copper reaches the via on (KiCad via_dangling: <= 1)."""
+        from check_connected import point_in_polygon
+        sup = {t.layer for t in self.via_tracks(v)}
+        r = _vr(v)
+        for px, py, pr, lay, *_ in self.pins:
+            if math.hypot(v.x - px, v.y - py) < pr + r:
+                sup |= set(copper_layers) if lay is None else lay
+        for z in self.zones:
+            if point_in_polygon(v.x, v.y, z.polygon):
+                sup.add(z.layer)
+        return sup & set(copper_layers)
 
 
-def _zone_net_units(segs, vias, pad_pts, zones):
-    """Candidate removal UNITS on a plane (zone) net. Deliberately narrow --
-    stitching vias and a pin's own drop to the plane are intentional even
-    when the pours make them topologically redundant (measured: a general
-    leaf rule would strip 136 GND vias):
+def _ends(x):
+    return (((x.start_x, x.start_y), (x.end_x, x.end_y)),
+            ((x.end_x, x.end_y), (x.start_x, x.start_y)))
 
-      * a trace RUN joining two vias A and B (one or more segments; interior
-        joints touch exactly two segments and nothing else): "the pin is
-        already dropped to the plane by a via, but the trace carries on to
-        another via". If one of the vias has no other connection (no other
-        trace, not in a pin), the run AND that via go; if both vias connect
-        onward (e.g. the far via also serves a pin), ONLY the run goes;
-      * a track with an end touching nothing at all (no same-net track, via,
-        pin, or same-net pour on its layer).
 
-    Runs that end on a pin or at a branch are never candidates, nor are vias
-    with no trace (stitching). Every unit is still subject to the
-    connectivity check, so a run that is a pin's only route to the plane
-    (e.g. the far via is outside the pour) is kept."""
-    from check_connected import point_in_polygon
-    def on_pad(x, y, extra=0.0):
-        return any(math.hypot(x - px, y - py) < r + extra + _EPS for px, py, r in pad_pts)
+# Units whose removal provably cannot disconnect anything (a pure leaf or a
+# pure copy) skip the connectivity check; keyed by frozenset of item ids.
+_SAFE = set()
 
-    def vias_at(x, y, skip=None):
-        return [w for w in vias if w is not skip and
-                math.hypot(w.x - x, w.y - y) < (getattr(w, 'size', 0.0) or 0.0) / 2.0 + _EPS]
 
-    def segs_at(x, y, skip):
-        return [t for t in segs if t is not skip and
-                (math.hypot(t.start_x - x, t.start_y - y) < t.width / 2.0 + _EPS or
-                 math.hypot(t.end_x - x, t.end_y - y) < t.width / 2.0 + _EPS or
-                 _pt_seg(x, y, t) < t.width / 2.0 + _EPS)]
+def _safe(unit):
+    _SAFE.add(frozenset(id(o) for _, o in unit))
+    return unit
 
-    def via_tracks(v):
-        vr = (getattr(v, 'size', 0.0) or 0.0) / 2.0
-        return [x for x in segs if _pt_seg(v.x, v.y, x) < vr + x.width / 2.0 - _EPS]
 
-    def via_on_pad(v):
-        return on_pad(v.x, v.y, (getattr(v, 'size', 0.0) or 0.0) / 2.0)
+def _seg_seg(a, b) -> float:
+    """Distance between two segments' centrelines."""
+    return min(_pt_seg(a.start_x, a.start_y, b), _pt_seg(a.end_x, a.end_y, b),
+               _pt_seg(b.start_x, b.start_y, a), _pt_seg(b.end_x, b.end_y, a))
 
+
+def _end_free(g, x, ex, ey, ox, oy):
+    """x is a PURE LEAF hanging from its other end (ox, oy): nothing touches
+    it anywhere except there -- no other track along its body (a T-joint
+    mid-body makes it a spine, not a tail), no via or pin on its body, and
+    no same-net pour on its layer at all. Removing such a segment cannot
+    disconnect anything, so the connectivity check is skipped."""
+    if any(z.layer == x.layer for z in g.zones):
+        return False
+    r_o = x.width / 2.0
     seen = set()
-    via_units, dead_units, run_units = [], [], []
-    for a in vias:
-        for first in via_tracks(a):
-            # far end of `first` relative to via a
-            def far_of(t, x, y):
-                return ((t.end_x, t.end_y)
-                        if math.hypot(t.start_x - x, t.start_y - y) <= math.hypot(t.end_x - x, t.end_y - y)
-                        else (t.start_x, t.start_y))
-            run = [first]
-            cur, (fx, fy) = first, far_of(first, a.x, a.y)
+    for c in g._cells(min(x.start_x, x.end_x) - 1.0, min(x.start_y, x.end_y) - 1.0,
+                      max(x.start_x, x.end_x) + 1.0, max(x.start_y, x.end_y) + 1.0):
+        for t in g.sgrid.get(c, ()):
+            if t is x or id(t) in seen or not g.live(t):
+                continue
+            seen.add(id(t))
+            if _seg_seg(x, t) < (x.width + t.width) / 2.0 + _EPS:
+                # allowed only if it touches x solely at the other end
+                if _pt_seg(ox, oy, t) >= t.width / 2.0 + r_o + _EPS:
+                    return False
+        for v in g.vgrid.get(c, ()):
+            if not g.live(v) or id(v) in seen:
+                continue
+            seen.add(id(v))
+            if _pt_seg(v.x, v.y, x) < _vr(v) + r_o + _EPS and \
+                    math.hypot(v.x - ox, v.y - oy) >= _vr(v) + r_o + _EPS:
+                return False
+    for px, py, pr, lay, *_ in g.pins:
+        if (lay is None or x.layer in lay) and _pt_seg(px, py, x) < pr + r_o + _EPS and \
+                math.hypot(px - ox, py - oy) >= pr + r_o + _EPS:
+            return False
+    return True
+
+
+def _junk_units(g: _NetGeom):
+    units = []
+    # duplicate vias
+    done = set()
+    for a in g.vias:
+        if not g.live(a):
+            continue
+        for b in g.vias_at(a.x, a.y, skip=a):
+            if math.hypot(a.x - b.x, a.y - b.y) >= min(_vr(a), _vr(b)):
+                continue
+            key = frozenset((id(a), id(b)))
+            if key in done:
+                continue
+            done.add(key)
+
+            def score(v):
+                inp = g.via_in_pin(v)
+                return (1 if inp else 0, -g.pin_dist(v) if inp else 0.0, len(g.via_tracks(v)))
+            keep, drop = (a, b) if score(a) >= score(b) else (b, a)
+            sl = {id(x): x for x in g.via_tracks(keep) + g.via_tracks(drop)
+                  if all(math.hypot(ex - keep.x, ey - keep.y) < _vr(keep) + _EPS or
+                         math.hypot(ex - drop.x, ey - drop.y) < _vr(drop) + _EPS
+                         for ex, ey in ((x.start_x, x.start_y), (x.end_x, x.end_y)))}
+            units.append([('via', drop)] + [('seg', x) for x in sl.values()])
+    # duplicate segments
+    seen = {}
+    for x in g.segs:
+        if not g.live(x):
+            continue
+        a = (round(x.start_x, 3), round(x.start_y, 3))
+        b = (round(x.end_x, 3), round(x.end_y, 3))
+        key = (x.layer,) + (a + b if a <= b else b + a)
+        if key in seen:
+            first = seen[key]
+            dup = x if x.width <= first.width else first
+            if dup is first:
+                seen[key] = x
+            units.append(_safe([('seg', dup)]))     # an exact copy
+        else:
+            seen[key] = x
+    # slivers inside one via; ends aimed at a pin on another layer
+    for x in g.segs:
+        if not g.live(x):
+            continue
+        if any(math.hypot(x.end_x - v.x, x.end_y - v.y) < _vr(v) + _EPS
+               for v in g.vias_at(x.start_x, x.start_y)):
+            units.append(_safe([('seg', x)]))       # wholly inside one barrel
+            continue
+        for (ex, ey), (ox, oy) in _ends(x):
+            if (g.over_wrong_layer_pin(ex, ey, x.layer) and not g.vias_at(ex, ey)
+                    and not g.touchers(x, ex, ey, ox, oy, same_layer=True)
+                    and not g.end_on_pin(ex, ey, x.layer)):
+                units.append([('seg', x)])
+                break
+    return units
+
+
+def _leaf_units(g: _NetGeom, copper_layers):
+    via_u, seg_u = [], []
+    for v in g.vias:
+        if not g.live(v):
+            continue
+        if copper_layers and len(g.support_layers(v, copper_layers)) <= 1:
+            via_u.append([('via', v)])
+        elif not g.via_in_pin(v) and len(g.via_tracks(v)) <= 1:
+            pour = any(g.in_pour(v.x, v.y, z.layer) for z in g.zones)
+            via_u.append(_safe([('via', v)]) if not pour else [('via', v)])
+    for s in g.segs:
+        if not g.live(s):
+            continue
+        for (ex, ey), (ox, oy) in _ends(s):
+            if not (g.touchers(s, ex, ey, ox, oy) or g.vias_at(ex, ey) or g.end_on_pin(ex, ey, s.layer)):
+                seg_u.append([('seg', s)])
+                break
+    return via_u + seg_u
+
+
+def _plane_units(g: _NetGeom):
+    via_u, dead_u, run_u = [], [], []
+    seen = set()
+
+    def far_of(t, x, y):
+        return ((t.end_x, t.end_y)
+                if math.hypot(t.start_x - x, t.start_y - y) <= math.hypot(t.end_x - x, t.end_y - y)
+                else (t.start_x, t.start_y))
+
+    for a in g.vias:
+        if not g.live(a):
+            continue
+        for first in g.via_tracks(a):
+            run, cur = [first], first
+            fx, fy = far_of(first, a.x, a.y)
             b = None
             for _ in range(10000):
-                if on_pad(fx, fy):
-                    break                          # reaches a pin: not a via-via run
-                wv = vias_at(fx, fy, skip=a)
+                if g.end_on_pin(fx, fy, cur.layer):
+                    break                                   # reaches a pin
+                wv = g.vias_at(fx, fy, skip=a)
                 if wv:
                     b = wv[0]
                     break
-                nxt = segs_at(fx, fy, cur)
-                if len(nxt) != 1:
-                    break                          # dead end or branch
+                nxt = [t for t in g.segs_reaching(fx, fy) if t is not cur]
+                if len(nxt) != 1 or nxt[0] in run:
+                    break                                   # dead end or branch
                 cur = nxt[0]
-                if cur in run:
-                    break
                 run.append(cur)
                 fx, fy = far_of(cur, fx, fy)
-            if b is None or b is a:
+            if b is None:
                 continue
             key = frozenset(id(t) for t in run)
             if key in seen:
                 continue
             seen.add(key)
-            run_ids = {id(t) for t in run}
+            ids = set(key)
 
             def alone(v):
-                return (not via_on_pad(v) and
-                        all(id(t) in run_ids for t in via_tracks(v)))
+                return not g.via_in_pin(v) and all(id(t) in ids for t in g.via_tracks(v))
             unit = [('seg', t) for t in run]
             if alone(b):
-                via_units.append([('via', b)] + unit)
+                via_u.append([('via', b)] + unit)
             elif alone(a):
-                via_units.append([('via', a)] + unit)
+                via_u.append([('via', a)] + unit)
             else:
-                run_units.append(unit)
-    for x in segs:
-        for ex, ey in ((x.start_x, x.start_y), (x.end_x, x.end_y)):
-            touched = (any(t is not x and _pt_seg(ex, ey, t) < t.width / 2.0 + _EPS for t in segs)
-                       or any(math.hypot(ex - w.x, ey - w.y) < (getattr(w, 'size', 0.0) or 0.0) / 2.0 + _EPS
-                              for w in vias)
-                       or on_pad(ex, ey)
-                       or any(z.layer == x.layer and point_in_polygon(ex, ey, z.polygon) for z in zones))
+                run_u.append(unit)
+    for x in g.segs:
+        if not g.live(x):
+            continue
+        for (ex, ey), (ox, oy) in _ends(x):
+            touched = bool(g.touchers(x, ex, ey, ox, oy) or g.vias_at(ex, ey)
+                           or g.end_on_pin(ex, ey, x.layer))
+            if not touched and g.end_on_pin(ox, oy, x.layer) and g.in_pour(ex, ey, x.layer):
+                touched = True                              # pin-to-pour stub
             if not touched:
-                dead_units.append([('seg', x)])
+                dead_u.append([('seg', x)])
                 break
-    # Continuations that take their via with them first (unwinding a chain
-    # from its far end), then dead-end tracks, then trace-only runs; each
-    # group in a deterministic geometric order.
-    def _key(u):
-        return tuple((k, round(getattr(o, 'x', getattr(o, 'start_x', 0.0)), 4),
-                      round(getattr(o, 'y', getattr(o, 'start_y', 0.0)), 4)) for k, o in u)
-    return (sorted(via_units, key=_key) + sorted(dead_units, key=_key)
-            + sorted(run_units, key=_key))
+    return via_u + dead_u + run_u
+
+
+def _pos(o):
+    if hasattr(o, 'start_x'):
+        return ((o.start_x + o.end_x) / 2.0, (o.start_y + o.end_y) / 2.0)
+    return (o.x, o.y)
 
 
 def prune_redundant_leaf_copper(results, pcb_data, scope_net_ids=None,
                                 protect_net_ids=None,
                                 keep_input_copper: bool = False,
-                                max_rounds: int = 500
+                                max_rounds: int = 200
                                 ) -> Tuple[int, int, List, List, int]:
     """Returns (segments_removed, vias_removed, input_segments_to_strip,
     input_vias_to_strip, nets_touched)."""
     from check_connected import check_net_connectivity, make_real_fill_validator
 
+    _SAFE.clear()
     protect = set(protect_net_ids or ())
     routed_seg = {id(s) for r in results for s in (r.get('new_segments') or [])}
     routed_via = {id(v) for r in results for v in (r.get('new_vias') or [])}
     all_zones = getattr(pcb_data, 'zones', None) or []
+    copper_layers = list(getattr(pcb_data.board_info, 'copper_layers', None) or [])
 
-    net_ids = sorted({s.net_id for s in pcb_data.segments} | {v.net_id for v in pcb_data.vias}
-                     | {v.net_id for r in results for v in (r.get('new_vias') or [])})
+    segs_by = defaultdict(list)
+    for s in pcb_data.segments:
+        segs_by[s.net_id].append(s)
+    vias_by = defaultdict(list)
+    seen_v = set()
+    for v in list(pcb_data.vias) + [v for r in results for v in (r.get('new_vias') or [])]:
+        if id(v) not in seen_v:
+            seen_v.add(id(v))
+            vias_by[v.net_id].append(v)
+
     rm_seg, rm_via = set(), set()
     strip_segs, strip_vias = [], []
     nets_touched = 0
-    for net_id in net_ids:
-        if not net_id or net_id in protect:
+    for net_id in sorted(set(segs_by) | set(vias_by)):
+        if not net_id:
             continue
         if scope_net_ids is not None and net_id not in scope_net_ids:
             continue
-        segs = [s for s in pcb_data.segments if s.net_id == net_id]
-        vias, seen = [], set()
-        for v in [v for v in pcb_data.vias if v.net_id == net_id] + \
-                 [v for r in results for v in (r.get('new_vias') or []) if v.net_id == net_id]:
-            if id(v) not in seen:
-                seen.add(id(v))
-                vias.append(v)
-        if not segs and not vias:
-            continue
         pads = pcb_data.pads_by_net.get(net_id, [])
         if not pads:
-            continue      # a pad-less net's copper is the orphan-island pass's business
+            continue      # a pin-less net's copper is the orphan-island pass's business
+        segs, vias = segs_by.get(net_id, []), vias_by.get(net_id, [])
+        if not segs and not vias:
+            continue
+        sig = (net_id in protect, len(segs), len(vias),
+               round(sum(s.start_x + 3 * s.start_y + 7 * s.end_x + 11 * s.end_y + 13 * s.width for s in segs), 6),
+               round(sum(v.x + 3 * v.y + 7 * v.size for v in vias), 6),
+               tuple(sorted({s.layer for s in segs})))
+        memo = getattr(pcb_data, '_redundant_copper_memo', None)
+        if memo is None:
+            memo = {}
+            try:
+                pcb_data._redundant_copper_memo = memo
+            except Exception:
+                pass
+        if memo.get(net_id) == sig:
+            continue          # unchanged since a pass that found nothing to remove
         zones = [z for z in all_zones if z.net_id == net_id]
+        g = _NetGeom(segs, vias, pads, zones)
+        dup_only = net_id in protect
         zcv = make_real_fill_validator(pcb_data, net_id) if zones else None
-        pad_pts = _pad_pts(pads)
 
-        def grade(sg, vs):
-            r = check_net_connectivity(net_id, sg, vs, pads, zones,
+        def grade():
+            ls = [x for x in g.segs if g.live(x)]
+            lv = [x for x in g.vias if g.live(x)]
+            r = check_net_connectivity(net_id, ls, lv, pads, zones,
                                        zone_credit_validator=zcv, pcb_data=pcb_data)
             return (bool(r.get('connected')), len(r.get('disconnected_pads') or []),
                     r.get('num_components') or 1)
 
-        base = grade(segs, vias)
+        base = None
+        refused = {}          # unit key -> representative position
         touched = False
-        copper_layers = list(getattr(pcb_data.board_info, 'copper_layers', None) or [])
         for _ in range(max_rounds):
-            changed = False
-            if zones:
-                units = _zone_net_units(segs, vias, pad_pts, zones)
-            else:
-                single = []
-                if copper_layers:
-                    from pcb_modification import _via_support_layers
-                    single = [v for v in vias
-                              if len(_via_support_layers(v, segs, pads, zones, copper_layers)) <= 1]
-                units = [[c] for c in _leaf_candidates(segs, vias, pad_pts, single)]
+            units = _junk_units(g)
+            if not dup_only:
+                units += _plane_units(g) if zones else _leaf_units(g, copper_layers)
+            removed_pts = []
             for unit in units:
-                # skip units already invalidated by an earlier removal this round
-                if any((o not in vias) if k == 'via' else (o not in segs) for k, o in unit):
+                if any(not g.live(o) for _, o in unit):
                     continue
                 if any(getattr(o, 'locked', False) or getattr(o, 'graphic', False) for _, o in unit):
                     continue
+                key = frozenset(id(o) for _, o in unit)
+                if key in refused:
+                    continue
+                pts = [_pos(o) for _, o in unit]
+                if any(math.hypot(px - qx, py - qy) < _STALE_R for px, py in pts for qx, qy in removed_pts):
+                    continue      # near this round's removals: re-derive next round
                 routed = [id(o) in (routed_via if k == 'via' else routed_seg) for k, o in unit]
                 if keep_input_copper and not all(routed):
                     continue
-                drop_v = {id(o) for k, o in unit if k == 'via'}
-                drop_s = {id(o) for k, o in unit if k == 'seg'}
-                trial_s = [x for x in segs if id(x) not in drop_s]
-                trial_v = [x for x in vias if id(x) not in drop_v]
-                after = grade(trial_s, trial_v)
-                worse = ((base[0] and not after[0]) or after[1] > base[1] or after[2] > base[2])
-                if worse:
+                if key in _SAFE:
+                    for _, o in unit:
+                        g.remove(o)
+                    after = base
+                else:
+                    if base is None:
+                        base = grade()
+                    for _, o in unit:
+                        g.remove(o)
+                    after = grade()
+                if after is not None and base is not None and (
+                        (base[0] and not after[0]) or after[1] > base[1] or after[2] > base[2]):
+                    for _, o in unit:
+                        g.restore(o)
+                    refused[key] = pts[0]
                     continue
-                segs, vias, base = trial_s, trial_v, after
-                changed = touched = True
+                base = after
+                touched = True
+                removed_pts.extend(pts)
                 for (k, o), rt in zip(unit, routed):
                     if k == 'via':
                         (rm_via.add(id(o)) if rt else strip_vias.append(o))
                     else:
                         (rm_seg.add(id(o)) if rt else strip_segs.append(o))
-                if zones:
-                    break    # plane nets: re-derive the units after every removal
-            if not changed:
+            if not removed_pts:
                 break
+            # a removal can change a nearby refusal's verdict: retry those
+            refused = {k: p for k, p in refused.items()
+                       if not any(math.hypot(p[0] - qx, p[1] - qy) < _STALE_R for qx, qy in removed_pts)}
         nets_touched += touched
+        if not touched:
+            memo[net_id] = sig
+        else:
+            memo.pop(net_id, None)
 
     # Mirror into the write-lists and pcb_data (the board that will be written).
     if rm_seg or rm_via:
