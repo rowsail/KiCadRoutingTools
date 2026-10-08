@@ -481,6 +481,28 @@ def run_post_route_cleanup(results, pcb_data, scope_net_ids, config, *,
                   f"{_sm_nets} net(s), -{_sm_stats.get('saved_mm', 0.0):.2f} mm "
                   f"of copper (#536)")
 
+    # Redundant leaf copper: dangling vias / dead-end tracks the dead-end
+    # sweep keeps (a via at a track end counts as its anchor there), and on
+    # plane nets the "pin dropped to the plane, trace carried on to another
+    # via" continuation. Each removal is kept only when the zone-aware
+    # connectivity check grades the net no worse; unfinished (protected)
+    # nets, stitching vias and a pad's own via are never touched.
+    # KICAD_PRUNE_REDUNDANT=0 disables it.
+    if os.environ.get('KICAD_PRUNE_REDUNDANT', '1') != '0':
+        _prog("redundant copper")
+        from redundant_copper import prune_redundant_leaf_copper
+        _rc_s, _rc_v, _rc_strip, _rc_vstrip, _rc_nets = prune_redundant_leaf_copper(
+            results, pcb_data, scope_net_ids, protect_net_ids=protect_net_ids,
+            keep_input_copper=keep_input_copper)
+        counts['redundant_segments'] = _rc_s
+        counts['redundant_vias'] = _rc_v
+        _trace('redundant_copper')
+        strip.extend(_rc_strip)
+        out.input_strip_vias.extend(_rc_vstrip)
+        if _rc_s or _rc_v:
+            print(f"{label}Redundant copper: removed {_rc_s} dead-end segment(s) "
+                  f"and {_rc_v} dangling/redundant via(s) on {_rc_nets} net(s)")
+
     # FINAL copper step (#319 ordering): nothing below may remove copper.
     # KICAD_NO_SOFT_JOINT_BRIDGE=1 is an A/B ablation knob (like
     # PRUNE_CONN_VERIFY / KICAD_BOARD_LEDGER): it isolates close's contribution
