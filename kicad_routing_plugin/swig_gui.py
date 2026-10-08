@@ -1311,15 +1311,17 @@ class RoutingDialog(wx.Dialog):
         options_inner.Add(self.add_teardrops_check, 0, wx.ALL, 3)
 
         self.fix_drc_check = wx.CheckBox(options_scroll, label="Fix DRC settings after routing")
-        self.fix_drc_check.SetValue(True)
+        # OFF by default (local change): it lowers the project's rules to the
+        # values just routed to, which can hide real violations.
+        self.fix_drc_check.SetValue(False)
         self.fix_drc_check.SetToolTip(
             "After routing, lower the live board's DRC Board Setup floors and the "
             "Default net class's CLEARANCE to the values just routed to (issue #160), "
             "so a manual DRC flags only genuine problems instead of stock-default "
             "noise. Never lowers net-class track/via draw sizes and never touches "
             "severities (#842/#856; see 'Relax DRC severities'). The board's next "
-            "save persists it. Mirrors the CLI's auto-fix (route.py, off via "
-            "--no-fix-drc-settings)")
+            "save persists it. OFF by default: it can lower class clearances "
+            "below what your design needs. Mirrors the CLI's --fix-drc-settings.")
         options_inner.Add(self.fix_drc_check, 0, wx.ALL, 3)
 
         # Guide corridor: follow a user-drawn polyline (issue #7)

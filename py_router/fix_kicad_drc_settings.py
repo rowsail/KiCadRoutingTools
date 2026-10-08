@@ -964,11 +964,19 @@ def add_drc_fix_args(parser, *, include_no_fix=True):
     ``fix_kicad_drc_settings`` script always fixes, so the flag is meaningless there)."""
     g = parser.add_argument_group("DRC settings (post-route, issue #160)")
     if include_no_fix:
-        g.add_argument("--no-fix-drc-settings", action="store_true",
-                       help="Do not adjust the output's .kicad_pro DRC constraints to match the "
-                            "routed clearances/sizes afterwards. By default the written project's "
-                            "Board Setup floors are loosened to the routed values so KiCad's DRC "
-                            "only flags genuine problems.")
+        # OFF by default (local change): the fix LOWERS the project's DRC
+        # floors and the Default class clearance to whatever was just routed,
+        # which can hide real violations (measured: 50R 0.508 and 1A 0.1524
+        # class clearances and the 0.2 hole clearance rewritten to 0.127).
+        # --fix-drc-settings opts in; --no-fix-drc-settings is still accepted.
+        g.add_argument("--no-fix-drc-settings", action="store_true", default=True,
+                       help="Do not adjust the project's DRC settings after routing "
+                            "(the default)")
+        g.add_argument("--fix-drc-settings", dest="no_fix_drc_settings",
+                       action="store_false",
+                       help="After routing, lower the project's DRC Board Setup floors "
+                            "and the Default net class clearance to the values just "
+                            "routed to (opt-in)")
     g.add_argument("--relax-drc-severities", action="store_true",
                    help="ALSO lower the project's DRC severities for the non-routing "
                         "categories (courtyard shapes, solder-mask bridges, footprint/"
