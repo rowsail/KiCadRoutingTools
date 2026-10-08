@@ -1607,7 +1607,7 @@ class RoutingDialog(wx.Dialog):
         options_inner.Add(self.upsize_pad_vias_check, 0, wx.ALL, 3)
         self.eliminate_small_vias_check = wx.CheckBox(
             options_scroll, label="Replace small-drill vias by re-routing (slow)")
-        self.eliminate_small_vias_check.SetValue(False)
+        self.eliminate_small_vias_check.SetValue(True)
         self.eliminate_small_vias_check.SetToolTip(
             "After routing, for each via at Board Setup's smallest drill: rip its net "
             "and the tracks that stop a full-size via (the net class via) from fitting, "
@@ -1615,7 +1615,8 @@ class RoutingDialog(wx.Dialog):
             "tracks cut off with full-size vias. A change is kept only if KiCad DRC shows "
             "no more unconnected items or errors. Many fabs price the board by its "
             "smallest drill, so removing the last few small vias can cut cost. Takes "
-            "minutes per spot; best on the LAST routing step.")
+            "minutes per spot; best on the LAST routing step. ON by default (local "
+            "change); it does nothing on a board with no small-drill vias.")
         options_inner.Add(self.eliminate_small_vias_check, 0, wx.ALL, 3)
         self.weld_stranded_check = wx.CheckBox(
             options_scroll, label="Weld stranded pour islands with a via")
@@ -2855,7 +2856,7 @@ class RoutingDialog(wx.Dialog):
         self.gpu_search_check.SetValue(self.gpu_search_check.IsEnabled())
         self.upsize_pad_vias_check.SetValue(False)
         self.weld_stranded_check.SetValue(True)
-        self.eliminate_small_vias_check.SetValue(False)
+        self.eliminate_small_vias_check.SetValue(True)
         self.upsize_max_pad.SetValue(3.0)
         self.upsize_max_drill.SetValue(0.0)
         # #857/#530: the CLI defaults, from the one place they live.

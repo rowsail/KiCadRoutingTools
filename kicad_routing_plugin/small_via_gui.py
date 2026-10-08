@@ -114,6 +114,10 @@ def run_small_via_pass(board, config, log_fn=print):
     if not os.path.exists(pro):
         log_fn(f"(small-via pass skipped: no project file {pro})")
         return None
+    small = sum(1 for t in board.GetTracks()
+                if t.GetClass() == 'PCB_VIA' and t.GetDrillValue() <= 150000)
+    if small == 0:
+        return None           # nothing to do: skip the (slow) DRC baseline
     work = tempfile.mkdtemp(prefix='krt_sve_')
     try:
         inp = os.path.join(work, 'in.kicad_pcb')
