@@ -168,6 +168,7 @@ def set_escalation_policy(policy, board_floors=None):
     _ESCALATION = policy
     _BOARD_FLOORS = {k: float(v) for k, v in (board_floors or {}).items()
                      if k in FLOOR_KEYS and v is not None and float(v) > 0}
+    _board_via_said.clear()
     reset_ledger()
 
 
@@ -309,8 +310,67 @@ def fab_floor_bucket(copper_layer_count):
                      fine_via_rung=len(fab_floor_ladder(n, 'auto', {})) > 2)
 
 
+_board_via_said = set()
+
+
+def _apply_board_via_capability(rungs, copper_layer_count):
+    """Board Setup's via minimums are the designer's statement of what their
+    fab can drill -- the same reading an explicit ``--via-size 0.3`` already
+    gets (physical_fab_floor). When the board declares a smaller minimum via
+    diameter / hole than a tier rung's floor, lower that rung's VIA floor to
+    the board's value, so net-class vias at that size are honoured instead of
+    being raised to the tier's 0.45/0.20. Never below the physical advanced
+    via, and never above it either: in this mode the declared via is the floor
+    at every rung, so 'auto' escalation cannot shrink a via below what the
+    designer said the fab can drill. Tracks and clearances keep the tier's
+    floors; an override file (handled by the caller) still decides
+    everything it names."""
+    bf = _BOARD_FLOORS
+    if not bf:
+        return rungs
+    phys = _layer_floors(copper_layer_count)['advanced']
+    cap = {k: max(float(bf[k]), phys[k]) for k in ('via_diameter', 'via_drill')
+           if bf.get(k) is not None}
+    # Capability mode only when the board declares a SMALLER via than the
+    # tier's nominal floor; otherwise the ladder is exactly the tier's.
+    if not cap or not any(rungs[0][k] > v + 1e-9 for k, v in cap.items()):
+        return rungs
+    out = []
+    for r in rungs:
+        rr = dict(r)
+        changed = False
+        for k, v in cap.items():
+            # The declared capability is the via floor at EVERY rung: lower a
+            # rung above it, and raise an escalation rung below it (the fab
+            # cannot drill smaller than the designer said).
+            if abs(rr[k] - v) > 1e-9:
+                rr[k] = v
+                changed = True
+        if changed:
+            rr['annular'] = min(rr.get('annular', 1.0),
+                                round((rr['via_diameter'] - rr['via_drill']) / 2.0, 4))
+            key = (rr['via_diameter'], rr['via_drill'])
+            if key not in _board_via_said:
+                _board_via_said.add(key)
+                print(f"  Board Setup declares vias down to {rr['via_diameter']:g}/"
+                      f"{rr['via_drill']:g} mm: using that as the fab's via capability "
+                      f"(net-class vias at that size are honoured; tracks and "
+                      f"clearances keep the fab tier's floors)")
+        if not out or rr != out[-1]:
+            out.append(rr)
+    return out
+
+
 def _tier_rungs(copper_layer_count, tier, overrides):
-    """The tier's rungs BEFORE the escalation policy is applied."""
+    """The tier's rungs BEFORE the escalation policy is applied (Board Setup's
+    via minimums applied -- see _apply_board_via_capability)."""
+    return _apply_board_via_capability(
+        _tier_rungs_raw(copper_layer_count, tier, overrides), copper_layer_count) \
+        if not overrides else _tier_rungs_raw(copper_layer_count, tier, overrides)
+
+
+def _tier_rungs_raw(copper_layer_count, tier, overrides):
+    """The tier's own rungs."""
     base = _layer_floors(copper_layer_count)
     if tier not in TIERS:
         raise ValueError(f"unknown fab tier {tier!r} (expected one of {TIERS})")
