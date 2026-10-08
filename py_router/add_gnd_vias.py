@@ -180,6 +180,80 @@ def add_gnd_vias_to_existing_board(
     import numpy as np
     _via_xs = np.array([v.x for v in pcb_data.vias], dtype=np.float64)
     _via_ys = np.array([v.y for v in pcb_data.vias], dtype=np.float64)
+
+    def _via_pair_min(v):
+        """Centre distance a new GND via needs from existing via `v`: copper
+        ring at KiCad's pairwise class clearance (the existing via's net class
+        vs the run clearance -- e.g. a 50R signal via at 0.508 mm), or the
+        drill hole-to-hole minimum, whichever is larger."""
+        _clr = (config.clearance if v.net_id in ground_ids
+                else config.obstacle_clearance(v.net_id))
+        _vs = getattr(v, 'size', 0) or config.via_size
+        _vd = getattr(v, 'drill', 0) or config.via_drill
+        return max(via_via_min_dist,
+                   _vs / 2 + config.via_size / 2 + _clr,
+                   _vd / 2 + config.via_drill / 2 + config.hole_to_hole_clearance)
+    _via_min = np.array([_via_pair_min(v) for v in pcb_data.vias], dtype=np.float64)
+
+    # Exact copper check (local change). The obstacle-map test below works on
+    # grid CELLS and, at the plan's 0.1 mm grid, passed vias up to ~0.03 mm
+    # inside a track/pad clearance; it also cannot see a class clearance wider
+    # than the cell ring it scans. Every candidate that passes the grid test is
+    # re-measured here against foreign segments and pads at KiCad's pairwise
+    # clearance: max(run clearance, the other net's class, a pad's own local
+    # clearance), on the layers both coppers share.
+    from check_drc import point_to_pad_distance, pad_copper_layers
+    _board_cu = list(pcb_data.board_info.copper_layers)
+    _BUCKET = 1.0
+    _seg_b: Dict[tuple, list] = {}
+    _pad_b: Dict[tuple, list] = {}
+    _reach = config.via_size / 2 + 0.6     # widest class clearance we expect
+
+    def _bucket_add(table, item, x0, y0, x1, y1):
+        for bx in range(int(math.floor((x0 - _reach) / _BUCKET)),
+                        int(math.floor((x1 + _reach) / _BUCKET)) + 1):
+            for by in range(int(math.floor((y0 - _reach) / _BUCKET)),
+                            int(math.floor((y1 + _reach) / _BUCKET)) + 1):
+                table.setdefault((bx, by), []).append(item)
+
+    for _sg in pcb_data.segments:
+        if _sg.net_id in ground_ids:
+            continue
+        _hw = _sg.width / 2
+        _bucket_add(_seg_b, _sg, min(_sg.start_x, _sg.end_x) - _hw,
+                    min(_sg.start_y, _sg.end_y) - _hw,
+                    max(_sg.start_x, _sg.end_x) + _hw,
+                    max(_sg.start_y, _sg.end_y) + _hw)
+    for _nid, _pads in pcb_data.pads_by_net.items():
+        if _nid in ground_ids:
+            continue
+        for _pd in _pads:
+            if getattr(_pd, 'pad_type', '') == 'np_thru_hole':
+                continue
+            _r = max(_pd.size_x, _pd.size_y) / 2 * 1.5
+            _bucket_add(_pad_b, _pd, _pd.global_x - _r, _pd.global_y - _r,
+                        _pd.global_x + _r, _pd.global_y + _r)
+
+    def _exact_copper_clear(x_mm, y_mm):
+        key = (int(math.floor(x_mm / _BUCKET)), int(math.floor(y_mm / _BUCKET)))
+        vr = config.via_size / 2
+        for sg in _seg_b.get(key, ()):
+            clr = config.stack_clearance(max(config.clearance,
+                                             config.obstacle_clearance(sg.net_id)))
+            gap = (point_to_segment_distance(x_mm, y_mm, sg.start_x, sg.start_y,
+                                             sg.end_x, sg.end_y) - sg.width / 2 - vr)
+            if gap < clr:
+                return False, f"exact_track_{sg.layer}({gap:.3f}<{clr:.3f})"
+        for pd in _pad_b.get(key, ()):
+            if not pad_copper_layers(pd, _board_cu):
+                continue
+            clr = config.stack_clearance(max(config.clearance,
+                                             config.obstacle_clearance(pd.net_id),
+                                             getattr(pd, 'local_clearance', 0.0) or 0.0))
+            gap = point_to_pad_distance(x_mm, y_mm, pd) - vr
+            if gap < clr:
+                return False, f"exact_pad_{pd.component_ref}.{pd.pad_number}({gap:.3f}<{clr:.3f})"
+        return True, ""
     _drill_pads = [pad for _nid, _pads in pcb_data.pads_by_net.items()
                    for pad in _pads if pad.drill and pad.drill > 0]
     _caps = [pad_drill_capsule(p) for p in _drill_pads]
@@ -224,6 +298,9 @@ def add_gnd_vias_to_existing_board(
                     if dx * dx + dy * dy <= via_check_radius_grid * via_check_radius_grid:
                         if obstacles.is_blocked(gx + dx, gy + dy, layer_idx):
                             return (False, f"track_blocked_layer{layer_idx}_at_({dx},{dy})")
+        _ok, _why = _exact_copper_clear(x_mm, y_mm)
+        if not _ok:
+            return (False, _why)
 
         # Check via-to-via clearance for OTHER vias (skip the signal via we're
         # targeting). Broadcast nominates (band around the strict < threshold
@@ -233,13 +310,14 @@ def add_gnd_vias_to_existing_board(
             _dxv = x_mm - _via_xs
             _dyv = y_mm - _via_ys
             _d2v = _dxv * _dxv + _dyv * _dyv
-            _thr = (via_via_min_dist * (1 + 1e-9)) ** 2
+            # Per-via threshold (class-aware, see _via_pair_min). The signal
+            # via is checked too: its class clearance can exceed the
+            # run-clearance min_distance the candidate ring starts at.
+            _thr = (_via_min * (1 + 1e-9)) ** 2
             for i in np.nonzero(_d2v < _thr)[0]:
                 via = pcb_data.vias[i]
-                if abs(via.x - sig_via_x) < 0.01 and abs(via.y - sig_via_y) < 0.01:
-                    continue
                 dist = math.sqrt((x_mm - via.x)**2 + (y_mm - via.y)**2)
-                if dist < via_via_min_dist:
+                if dist < _via_min[i]:
                     return (False, f"too_close_to_via({dist:.2f}mm)")
 
         # Check drill hole-to-hole clearance from through-hole pad drills (a

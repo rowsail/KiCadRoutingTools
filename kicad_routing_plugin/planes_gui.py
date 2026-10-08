@@ -945,6 +945,13 @@ class PlanesTab(wx.Panel):
                     continue
                 _plane_net_clearances[net.net_id] = class_clearance_cache.get(
                     cname, _plane_clearance)
+            if not all_net_to_class:
+                # No live pcbnew board (headless plan runner): read the classes
+                # from the project; an empty map would also stop the engine's
+                # own auto-read and drop every class clearance.
+                from .fanout_gui import _net_clearances_from_project
+                _plane_net_clearances = _net_clearances_from_project(
+                    self.board_filename, self.pcb_data)
             if _plane_clamp:
                 _plane_net_clearances = {nid: min(clr, _plane_clearance)
                                          for nid, clr in _plane_net_clearances.items()}
@@ -1104,6 +1111,11 @@ class PlanesTab(wx.Panel):
                         # (same reasoning as _run_kicad_oracle_after_apply).
                         board_edge_clearance=_gnd_via_edge_clearance(),
                     )
+                    # Foreign copper at its net class clearance (pairwise
+                    # max(Default, class)): without this, return vias were placed
+                    # at the run clearance next to e.g. 50R (0.508 mm) copper.
+                    if _plane_net_clearances:
+                        gnd_config.net_clearances = dict(_plane_net_clearances)
                     coord = GridCoord(gnd_config.grid_step)
 
                     # Build obstacle map from PCB data (excluding no nets since we want all obstacles)

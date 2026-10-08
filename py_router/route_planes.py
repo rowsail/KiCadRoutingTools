@@ -4614,6 +4614,17 @@ Examples:
         )
         from kicad_dru import install_layer_clearances
         install_layer_clearances(gnd_config, None, None, pcb_data)  # #498
+        # Foreign copper at its net class clearance (pairwise max(Default,
+        # class)), as the plane taps do: without this, return vias were placed
+        # at the run clearance next to e.g. 50R (0.508 mm) copper.
+        try:
+            from list_nets import net_clearance_map_by_id
+            _gnd_nc = net_clearance_map_by_id(
+                args.input_file, {nid: n.name for nid, n in pcb_data.nets.items()})
+            if _gnd_nc:
+                gnd_config.net_clearances = dict(_gnd_nc)
+        except Exception as _e:                                # noqa: BLE001
+            print(f"  Warning: GND vias: could not read netclass clearances ({_e})")
         coord = GridCoord(gnd_config.grid_step)
 
         # Build obstacle map

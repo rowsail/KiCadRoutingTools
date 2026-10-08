@@ -3552,6 +3552,13 @@ class RoutingDialog(wx.Dialog):
                 # #530: the Class ceiling box (== the CLI passing --clearance-ceiling)
                 # caps each class at min(class, clearance). Unchecked = every
                 # other class routed at its own clearance, no clamp.
+                if not all_net_to_class:
+                    # No live pcbnew board (headless plan runner): read the
+                    # classes from the project instead of routing every net
+                    # at the run's clearance.
+                    from .fanout_gui import _net_clearances_from_project
+                    net_clearances = _net_clearances_from_project(
+                        self.board_filename, self.pcb_data)
                 if config.get('clamp_netclasses', False):
                     _base_clr = config['clearance']
                     net_clearances = {nid: min(clr, _base_clr)

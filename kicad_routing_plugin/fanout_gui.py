@@ -48,6 +48,22 @@ from kicad_parser import mm_to_iu
 CAP_DEFAULT_VIA_SIZE = 0.3
 
 
+def _net_clearances_from_project(board_filename, pcb_data):
+    """{net_id: class clearance} for every non-Default net, read from the
+    board's .kicad_pro -- the fallback when no live pcbnew board exists (the
+    headless plan runner, run_plan.py). Without it the live-board lookup
+    returns only 'Default', the callers pass an EMPTY map, and an explicit
+    empty map also stops the engine's own auto-read: every net class
+    clearance (e.g. a 0.508 mm RF class) is silently ignored."""
+    try:
+        from list_nets import net_clearance_map_by_id
+        return dict(net_clearance_map_by_id(
+            board_filename, {nid: n.name for nid, n in pcb_data.nets.items()}) or {})
+    except Exception as e:                                    # noqa: BLE001
+        print(f"Warning: could not read net class clearances from the project ({e})")
+        return {}
+
+
 def _get_net_classes_from_board():
     """Get net class mapping from pcbnew.
 
