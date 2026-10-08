@@ -894,6 +894,49 @@ def route_single_ended_nets(
                     )
                     # Blocker-selection algorithm (#424 audit; --ripup-blocker-select).
                     _bsel = getattr(config, 'ripup_blocker_select', 'count')
+                    _gpu_set = []
+                    if _bsel == 'gpu' and state.working_obstacles is not None and \
+                            state.net_obstacles_cache is not None and \
+                            single_sources and single_targets:
+                        # GPU blocker finder + parallel rip-up trials (see
+                        # gpu_blockers): the cheapest set of rippable nets the
+                        # failed connection must cross, among ALL nets routed
+                        # this run (not only the frontier-named ones), with
+                        # alternatives tested for re-routability.
+                        try:
+                            from blocking_analysis import BlockingInfo as _BI
+                            from gpu_blockers import plan_rip_sets
+                            _excl = rip_exclude_set(state, net_id)
+                            _univ = [_BI(net_id=_n, net_name=(pcb_data.nets[_n].name if _n in pcb_data.nets else str(_n)),
+                                         blocked_count=0, track_cells=0, via_cells=0, unique_cells=0,
+                                         near_target_cells=0, near_source_cells=0, details="gpu universe")
+                                     for _n in routed_results if _n not in _excl and _n != net_id]
+                            _univ_ok, _ = filter_rippable_blockers(
+                                _univ, routed_results, diff_pair_by_net_id, get_canonical_net_id,
+                                pcb_data=pcb_data, context="GPU rip plan")
+                            _sets, _feas = plan_rip_sets(
+                                pcb_data, config, state.working_obstacles, net_id,
+                                [(s[0], s[1], s[2]) for s in single_sources],
+                                [(t[0], t[1], t[2]) for t in single_targets],
+                                [b.net_id for b in _univ_ok], state.net_obstacles_cache)
+                            if _sets:
+                                _best = _sets[0]
+                                _by = {b.net_id: b for b in list(rippable_blockers) + _univ_ok}
+                                _gpu_set = [_by[n] for n in _best['nets'] if n in _by]
+                                _gids = {b.net_id for b in _gpu_set}
+                                rippable_blockers = _gpu_set + [b for b in rippable_blockers
+                                                                if b.net_id not in _gids]
+                                seen_canonical_ids |= {get_canonical_net_id(b.net_id, diff_pair_by_net_id)
+                                                       for b in _gpu_set}
+                                print(f"  GPU rip plan: rip {[b.net_name for b in _gpu_set]} "
+                                      f"(best of {len(_sets)} candidate set(s); its ripped nets "
+                                      f"re-routable {_best['reroutable']}/{_best['checked']})")
+                            elif not _feas:
+                                print(f"  GPU rip plan: no path even through rippable copper "
+                                      f"(the wall is static) -- keeping the frontier order")
+                        except Exception as _ge:                       # noqa: BLE001
+                            print(f"  GPU rip plan unavailable ({_ge}); using frontier order")
+                            _gpu_set = []
                     if _bsel == 'mincut' and rippable_blockers and \
                             state.working_obstacles is not None and \
                             state.net_obstacles_cache is not None:
@@ -990,7 +1033,8 @@ def route_single_ended_nets(
                         N += 1
                         # For N > 1, re-analyze from the last retry's blocked cells
                         # to find the most blocking net from that specific failure
-                        if N > 1 and last_retry_blocked_cells:
+                        # -- unless the GPU rip plan named a set: take it in order.
+                        if N > 1 and last_retry_blocked_cells and not (_gpu_set and N <= len(_gpu_set)):
                             print(f"  Re-analyzing {len(last_retry_blocked_cells)} blocked cells from N={N-1} retry:")
                             fresh_blockers = analyze_frontier_blocking(
                                 last_retry_blocked_cells, pcb_data, config, routed_net_paths,

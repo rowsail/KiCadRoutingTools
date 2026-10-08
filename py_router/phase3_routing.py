@@ -964,6 +964,41 @@ def try_phase3_ripup(
             print(f"    MINCUT probe (net-level): no path with rippable "
                   f"copper soft-costed -- keeping per-edge ranking")
 
+    # GPU blocker finder + parallel rip-up trials (gpu_blockers), net-level
+    # like the mincut probe: the net's two largest disconnected groups.
+    _gpu_set = []
+    if (getattr(config, 'ripup_blocker_select', 'count') == 'gpu'
+            and getattr(state, 'working_obstacles', None) is not None
+            and getattr(state, 'net_obstacles_cache', None) is not None):
+        try:
+            from connectivity import get_net_endpoints
+            from blocking_analysis import BlockingInfo as _BI
+            from gpu_blockers import plan_rip_sets
+            _src, _tgt, _err = get_net_endpoints(pcb_data, net_id, config)
+            if _src and _tgt:
+                _univ = [_BI(net_id=_n, net_name=(pcb_data.nets[_n].name if _n in pcb_data.nets else str(_n)),
+                             blocked_count=0, track_cells=0, via_cells=0, unique_cells=0,
+                             near_target_cells=0, near_source_cells=0, details="gpu universe")
+                         for _n in routed_results if _n not in exclude_ids and _n != net_id]
+                _univ_ok, _ = filter_rippable_blockers(
+                    _univ, routed_results, diff_pair_by_net_id, get_canonical_net_id,
+                    pcb_data=pcb_data, context="GPU rip plan (phase3)")
+                _sets, _feas = plan_rip_sets(
+                    pcb_data, config, state.working_obstacles, net_id,
+                    [(a[0], a[1], a[2]) for a in _src], [(b[0], b[1], b[2]) for b in _tgt],
+                    [b.net_id for b in _univ_ok], state.net_obstacles_cache)
+                if _sets:
+                    _best = _sets[0]
+                    _by = {b.net_id: b for b in list(rippable_blockers) + _univ_ok}
+                    _gpu_set = [_by[n] for n in _best['nets'] if n in _by]
+                    _gids = {b.net_id for b in _gpu_set}
+                    rippable_blockers = _gpu_set + [b for b in rippable_blockers if b.net_id not in _gids]
+                    print(f"    GPU rip plan (net-level): rip {[b.net_name for b in _gpu_set]} "
+                          f"(best of {len(_sets)}; re-routable {_best['reroutable']}/{_best['checked']})")
+        except Exception as _ge:                                   # noqa: BLE001
+            print(f"    GPU rip plan unavailable ({_ge}); keeping per-edge ranking")
+            _gpu_set = []
+
     # Progressive rip-up: try N=1, then N=2, etc up to max_rip_up_count
     ripped_items = []  # Track nets ripped in this attempt
     ripped_canonical_ids = set()
@@ -971,8 +1006,9 @@ def try_phase3_ripup(
     original_failed_count = completed_result.get('tap_edges_failed', 0)
 
     for N in range(1, config.max_rip_up_count + 1):
-        # For N > 1, re-analyze from the last retry's blocked cells
-        if N > 1 and last_retry_blocked_cells:
+        # For N > 1, re-analyze from the last retry's blocked cells -- unless
+        # the GPU rip plan named a set: take it in order.
+        if N > 1 and last_retry_blocked_cells and not (_gpu_set and N <= len(_gpu_set)):
             print(f"    Re-analyzing {len(last_retry_blocked_cells)} blocked cells from N={N-1} retry:")
             fresh_blockers = analyze_frontier_blocking(
                 last_retry_blocked_cells, pcb_data, config, routed_net_paths,

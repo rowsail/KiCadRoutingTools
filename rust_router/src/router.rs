@@ -1467,6 +1467,192 @@ impl GridRouter {
         })
     }
 
+    /// GPU soft-cost path (rip-up blocker finder). Floods the cost-to-go from
+    /// the targets over a window of `obstacles` (normally a clone with the
+    /// rippable nets' copper LIFTED) where every cell in `extra_cost`
+    /// (x, y, layer, cost) adds that cost on entry -- the rippable copper,
+    /// made expensive instead of solid -- then walks the cheapest path from
+    /// the best source down the field. Same move set, legality and integer
+    /// costs as route_with_frontier_gpu. Returns (path or None, cost, gpu_ms);
+    /// None = no path even through the soft copper (a static wall) or no GPU.
+    #[pyo3(signature = (obstacles, sources, targets, extra_cost, clip=None, margin=200,
+                        via_rung=0, max_cells=24_000_000))]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity, unused_variables)]
+    pub fn gpu_soft_path(
+        &self,
+        py: Python<'_>,
+        obstacles: &GridObstacleMap,
+        sources: Vec<(i32, i32, u8)>,
+        targets: Vec<(i32, i32, u8)>,
+        extra_cost: Vec<(i32, i32, u8, u32)>,
+        clip: Option<(i32, i32, i32, i32)>,
+        margin: i32,
+        via_rung: usize,
+        max_cells: usize,
+    ) -> (Option<Vec<(i32, i32, u8)>>, u64, f64) {
+        #[cfg(not(feature = "gpu"))]
+        { return (None, 0, 0.0); }
+        #[cfg(feature = "gpu")]
+        py.allow_threads(|| {
+            if sources.is_empty() || targets.is_empty() || !crate::lee::available() {
+                return (None, 0, 0.0);
+            }
+            let t0 = std::time::Instant::now();
+            let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+            for &(x, y, _) in sources.iter().chain(targets.iter()) {
+                x0 = x0.min(x); y0 = y0.min(y); x1 = x1.max(x); y1 = y1.max(y);
+            }
+            let (tx0, ty0, tx1, ty1) = (x0, y0, x1, y1);
+            x0 -= margin; y0 -= margin; x1 += margin; y1 += margin;
+            if let Some((cx0, cy0, cx1, cy1)) = clip {
+                x0 = x0.max(cx0.min(tx0)); y0 = y0.max(cy0.min(ty0));
+                x1 = x1.min(cx1.max(tx1)); y1 = y1.min(cy1.max(ty1));
+            }
+            let w = (x1 - x0 + 1) as usize;
+            let h = (y1 - y0 + 1) as usize;
+            let l = obstacles.num_layers;
+            let n = w * h * l;
+            if n == 0 || n > max_cells { return (None, 0, 0.0); }
+            let mut cell = vec![0u8; n];
+            let mut prox = vec![0u32; n];
+            let mut via = vec![0u8; w * h];
+            {
+                let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(1).min(16);
+                let rows = l * h;
+                let chunk = rows.div_ceil(threads).max(1);
+                std::thread::scope(|sc| {
+                    for (ci, (cc, pc)) in cell.chunks_mut(chunk * w).zip(prox.chunks_mut(chunk * w)).enumerate() {
+                        sc.spawn(move || {
+                            let r0 = ci * chunk;
+                            for (k, (crow, prow)) in cc.chunks_mut(w).zip(pc.chunks_mut(w)).enumerate() {
+                                let r = r0 + k;
+                                let (li, yy) = (r / h, r % h);
+                                let gy = y0 + yy as i32;
+                                for xx in 0..w {
+                                    let gx = x0 + xx as i32;
+                                    crow[xx] = (!obstacles.is_blocked(gx, gy, li)) as u8;
+                                    let p = obstacles.get_stub_proximity_cost(gx, gy)
+                                        + obstacles.get_layer_proximity_cost(gx, gy, li);
+                                    prow[xx] = p.max(0) as u32;
+                                }
+                            }
+                        });
+                    }
+                    let vchunk = h.div_ceil(threads).max(1);
+                    for (ci, vc) in via.chunks_mut(vchunk * w).enumerate() {
+                        sc.spawn(move || {
+                            for (k, vrow) in vc.chunks_mut(w).enumerate() {
+                                let gy = y0 + (ci * vchunk + k) as i32;
+                                for xx in 0..w {
+                                    let gx = x0 + xx as i32;
+                                    let ok = !obstacles.is_via_blocked_rung(gx, gy, via_rung);
+                                    let free = obstacles.is_free_via(gx, gy);
+                                    vrow[xx] = (ok as u8) | ((free as u8) << 1);
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+            let inw = |x: i32, y: i32| x >= x0 && y >= y0 && x <= x1 && y <= y1;
+            let idx = |x: i32, y: i32, ly: u8| -> usize {
+                ((ly as usize * h) + (y - y0) as usize) * w + (x - x0) as usize
+            };
+            for &(x, y, ly, c) in &extra_cost {
+                if (ly as usize) < l && inw(x, y) {
+                    let i = idx(x, y, ly);
+                    prox[i] = prox[i].saturating_add(c);
+                }
+            }
+            let mut seeds = Vec::with_capacity(targets.len());
+            for &(x, y, ly) in &targets {
+                if (ly as usize) < l && inw(x, y) { let c = idx(x, y, ly); cell[c] |= 3; seeds.push(c as u32); }
+            }
+            let lc: Vec<i32> = (0..l).map(|i| self.layer_costs.get(i).copied().unwrap_or(1000)).collect();
+            let (dist, _r) = match crate::lee::flood(w, h, l, &cell, &via, &prox, &lc,
+                                                     self.via_cost, self.via_proximity_cost, &seeds) {
+                Some(r) => r,
+                None => return (None, 0, 0.0),
+            };
+            // best source
+            let mut cur: Option<(i32, i32, u8)> = None;
+            let mut best = crate::lee::INF;
+            for &(x, y, ly) in &sources {
+                if (ly as usize) < l && inw(x, y) {
+                    let d = dist[idx(x, y, ly)];
+                    if d < best { best = d; cur = Some((x, y, ly)); }
+                }
+            }
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let Some(mut c) = cur else { return (None, 0, ms); };
+            let total = best as u64;
+            let lcd = |i: usize| -> i32 { let v = lc[i]; if v >= 0 { v } else { 1000 } };
+            const DX: [i32; 8] = [1, -1, 0, 0, 1, 1, -1, -1];
+            const DY: [i32; 8] = [0, 0, 1, -1, 1, -1, 1, -1];
+            let mut path = vec![c];
+            for _ in 0..(n.min(2_000_000)) {
+                let ci = idx(c.0, c.1, c.2);
+                let dc = dist[ci];
+                if dc == 0 { break; }
+                let mut next: Option<((i32, i32, u8), u32)> = None;
+                let (x, y, ly) = (c.0, c.1, c.2);
+                // same-layer moves (not on a forbidden layer)
+                if lc[ly as usize] >= 0 {
+                    let mult = lc[ly as usize] as i64;
+                    for k in 0..8 {
+                        let (nx, ny) = (x + DX[k], y + DY[k]);
+                        if !inw(nx, ny) { continue; }
+                        let ni = idx(nx, ny, ly);
+                        if cell[ni] & 1 == 0 || dist[ni] == crate::lee::INF { continue; }
+                        let base: i64 = if k < 4 { 1000 } else { 1414 };
+                        let step = (base * mult / 1000) as u64 + prox[ni] as u64;
+                        let tot = dist[ni] as u64 + step;
+                        if tot == dc as u64 { next = Some(((nx, ny, ly), dist[ni])); break; }
+                        if next.is_none() || tot < next.unwrap().1 as u64 + 0 { }
+                    }
+                }
+                if next.is_none() && l > 1 {
+                    let v = via[(y - y0) as usize * w + (x - x0) as usize];
+                    if v & 3 != 0 {
+                        let free = v & 2 != 0;
+                        for l2 in 0..l {
+                            if l2 == ly as usize || lc[l2] < 0 { continue; }
+                            let ni = idx(x, y, l2 as u8);
+                            if cell[ni] & 1 == 0 || dist[ni] == crate::lee::INF { continue; }
+                            let cc = ((if free { 0 } else { self.via_cost }) + lc[l2] - lcd(ly as usize)).max(0) as u64
+                                + prox[ni] as u64 * self.via_proximity_cost.max(0) as u64;
+                            if dist[ni] as u64 + cc == dc as u64 { next = Some(((x, y, l2 as u8), dist[ni])); break; }
+                        }
+                    }
+                }
+                // fallback: steepest descent (should not be needed)
+                if next.is_none() {
+                    let mut bestn: Option<((i32, i32, u8), u32)> = None;
+                    for k in 0..8 {
+                        let (nx, ny) = (x + DX[k], y + DY[k]);
+                        if !inw(nx, ny) { continue; }
+                        let ni = idx(nx, ny, ly);
+                        if cell[ni] & 1 == 0 { continue; }
+                        if bestn.map_or(true, |b| dist[ni] < b.1) { bestn = Some(((nx, ny, ly), dist[ni])); }
+                    }
+                    for l2 in 0..l {
+                        if l2 == ly as usize { continue; }
+                        let ni = idx(x, y, l2 as u8);
+                        if cell[ni] & 1 == 0 { continue; }
+                        if bestn.map_or(true, |b| dist[ni] < b.1) { bestn = Some(((x, y, l2 as u8), dist[ni])); }
+                    }
+                    match bestn {
+                        Some(b) if b.1 < dc => next = Some(b),
+                        _ => return (None, total, ms),
+                    }
+                }
+                c = next.unwrap().0;
+                path.push(c);
+            }
+            (Some(path), total, t0.elapsed().as_secs_f64() * 1000.0)
+        })
+    }
+
     /// Hybrid GPU search (route_with_frontier's full-search replacement).
     ///
     /// Floods the cost-to-go from the targets on the GPU over a window (bbox

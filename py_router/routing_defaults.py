@@ -140,7 +140,7 @@ RIPUP_BLOCKER_SELECT = 'count'
 # CHEAP net is preferred as the rip victim. Plain 'count' correlates with
 # victim SIZE, so the router systematically rips the most expensive net it
 # could have picked (muzy_zynq2: +3V3 ripped 67x = 40% of all torn copper).
-RIPUP_BLOCKER_SELECT_CHOICES = ('count', 'near-target', 'bidir', 'mincut', 'cost')
+RIPUP_BLOCKER_SELECT_CHOICES = ('count', 'near-target', 'bidir', 'mincut', 'cost', 'gpu')
 
 # Layer direction preference (0=horizontal, 1=vertical, 255=none)
 # Alternates H/V starting with horizontal on top layer
