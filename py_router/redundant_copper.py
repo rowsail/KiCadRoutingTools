@@ -56,6 +56,12 @@ _CELL = 0.5          # spatial-index cell (mm)
 _STALE_R = 2.0       # units this close to a removal wait for the next round
 
 
+_SHADOW_MIN_LEN = 0.05     # mm: shorter pieces are left to the sliver rules
+_SHADOW_OVERLAP = 0.005    # mm: copper must truly overlap, not just meet
+_SHADOW_CONTAIN_TOL = 0.005  # mm
+_SHADOW_PARALLEL_MIN_LEN = 1.0  # mm
+
+
 def _pt_seg(px, py, s) -> float:
     ax, ay, bx, by = s.start_x, s.start_y, s.end_x, s.end_y
     dx, dy = bx - ax, by - ay
@@ -278,6 +284,46 @@ def _junk_units(g: _NetGeom):
             units.append(_safe([('seg', dup)]))     # an exact copy
         else:
             seen[key] = x
+    # shadow tracks: a segment whose whole centreline overlaps other same-net
+    # copper on its layer adds nothing (measured: a single-ended join of USB-C
+    # D+ pins ran 40 mm alongside the coupled pair's own D+, overlapping it,
+    # and ended in a dangling stub). Graded like any unit, so a shadow that is
+    # the only link for a via or pin on its body is kept.
+    for x in g.segs:
+        if not g.live(x):
+            continue
+        L = math.hypot(x.end_x - x.start_x, x.end_y - x.start_y)
+        if L < _SHADOW_MIN_LEN:
+            continue
+        cand = []
+        seen = set()
+        r = x.width / 2.0
+        for c in g._cells(min(x.start_x, x.end_x) - 1.0, min(x.start_y, x.end_y) - 1.0,
+                          max(x.start_x, x.end_x) + 1.0, max(x.start_y, x.end_y) + 1.0):
+            for t in g.sgrid.get(c, ()):
+                if t is x or id(t) in seen or not g.live(t) or t.layer != x.layer:
+                    continue
+                seen.add(id(t))
+                if _seg_seg(x, t) < (x.width + t.width) / 2.0 - _SHADOW_OVERLAP:
+                    cand.append(t)
+        if not cand:
+            continue
+        n = max(2, int(L / 0.1) + 1)
+        pts = [(x.start_x + k / (n - 1) * (x.end_x - x.start_x),
+                x.start_y + k / (n - 1) * (x.end_y - x.start_y)) for k in range(n)]
+        # (a) its copper lies wholly inside other same-net copper: removing it
+        #     changes nothing physical, at any length or width;
+        contained = all(any(_pt_seg(px, py, t) + r <= t.width / 2.0 + _SHADOW_CONTAIN_TOL
+                            for t in cand) for px, py in pts)
+        # (b) a LONG parallel overlap of a track at least as wide (the USB
+        #     case: same width, offset 0.15 mm). Never a wider track under a
+        #     thinner one -- that would neck a power trace.
+        wide = [t for t in cand if t.width >= x.width - 1e-6]
+        overlapped = (L >= _SHADOW_PARALLEL_MIN_LEN and wide and
+                      all(any(_pt_seg(px, py, t) < r + t.width / 2.0 - _SHADOW_OVERLAP
+                              for t in wide) for px, py in pts))
+        if contained or overlapped:
+            units.append([('seg', x)])
     # slivers inside one via; ends aimed at a pin on another layer
     for x in g.segs:
         if not g.live(x):
