@@ -54,6 +54,7 @@ def get_dialog_settings(dialog):
         'gpu_plan': dialog.gpu_plan_check.GetValue(),
         'gpu_search': dialog.gpu_search_check.GetValue(),
         'upsize_pad_vias': dialog.upsize_pad_vias_check.GetValue(),
+        'weld_stranded_pours': dialog.weld_stranded_check.GetValue(),
         'upsize_max_pad': dialog.upsize_max_pad.GetValue(),
         'upsize_max_drill': dialog.upsize_max_drill.GetValue(),
         'power_nets': dialog.power_nets_ctrl.GetValue(),
@@ -360,6 +361,8 @@ def restore_dialog_settings(dialog, settings):
         dialog.gpu_plan_check.SetValue(bool(settings['gpu_plan']))
     if 'gpu_search' in settings and dialog.gpu_search_check.IsEnabled():
         dialog.gpu_search_check.SetValue(bool(settings['gpu_search']))
+    if 'weld_stranded_pours' in settings:
+        dialog.weld_stranded_check.SetValue(bool(settings['weld_stranded_pours']))
     if 'upsize_pad_vias' in settings:
         dialog.upsize_pad_vias_check.SetValue(bool(settings['upsize_pad_vias']))
     if 'upsize_max_pad' in settings:

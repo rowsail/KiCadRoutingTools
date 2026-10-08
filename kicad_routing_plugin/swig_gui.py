@@ -1605,6 +1605,17 @@ class RoutingDialog(wx.Dialog):
             "afterwards. Fewer small drills means a cheaper board. Best on the LAST "
             "routing step, since bigger vias leave less room for later routing.")
         options_inner.Add(self.upsize_pad_vias_check, 0, wx.ALL, 3)
+        self.weld_stranded_check = wx.CheckBox(
+            options_scroll, label="Weld stranded pour islands with a via")
+        self.weld_stranded_check.SetValue(True)
+        self.weld_stranded_check.SetToolTip(
+            "After routing, if KiCad still reports unconnected items, look for pour "
+            "islands that hold a pad of their own net but are cut off from the main "
+            "pour (e.g. a GND pad boxed in by signal tracks), and drop a via inside "
+            "each down to the plane -- the net's usual via if it fits, else the "
+            "smallest Board Setup allows. Every via is checked with KiCad's own "
+            "shapes and kept only if KiCad's unconnected count goes down.")
+        options_inner.Add(self.weld_stranded_check, 0, wx.ALL, 3)
         _uv = wx.BoxSizer(wx.HORIZONTAL)
         _uv.Add(wx.StaticText(options_scroll, label="  max pad (mm)"), 0,
                 wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
@@ -2831,6 +2842,7 @@ class RoutingDialog(wx.Dialog):
         self.gpu_plan_check.SetValue(False)
         self.gpu_search_check.SetValue(self.gpu_search_check.IsEnabled())
         self.upsize_pad_vias_check.SetValue(False)
+        self.weld_stranded_check.SetValue(True)
         self.upsize_max_pad.SetValue(3.0)
         self.upsize_max_drill.SetValue(0.0)
         # #857/#530: the CLI defaults, from the one place they live.
@@ -3224,6 +3236,7 @@ class RoutingDialog(wx.Dialog):
             'gpu_plan': self.gpu_plan_check.GetValue(),
             'gpu_search': self.gpu_search_check.GetValue(),
             'upsize_pad_vias': self.upsize_pad_vias_check.GetValue(),
+            'weld_stranded_pours': self.weld_stranded_check.GetValue(),
             'upsize_max_pad': self.upsize_max_pad.GetValue(),
             'upsize_max_drill': self.upsize_max_drill.GetValue(),
             'clamp_netclasses': self._ceiling_on(),
@@ -4235,6 +4248,25 @@ class RoutingDialog(wx.Dialog):
                     refill_all_zones(board)
             except Exception as e:
                 print(f"(via growth skipped: {e})")
+
+        # Local addition: weld pour islands that hold an own-net pad but are cut
+        # off from the main pour (stranded_pour_vias.py). Inert when KiCad
+        # reports nothing unconnected.
+        if config.get('weld_stranded_pours', True):
+            try:
+                from stranded_pour_vias import weld_stranded_pour_fragments
+                self._apply_status("Checking for stranded pour islands...")
+                _ws = weld_stranded_pour_fragments(board)
+                if _ws.get('fragments'):
+                    print(f"Stranded pour islands: {_ws['fragments']} found, {_ws['welded']} "
+                          f"welded (KiCad unconnected {_ws['unconnected_before']} -> "
+                          f"{_ws['unconnected_after']})"
+                          + "".join(f"\n    via {v[3]}/{v[4]} at ({v[0]}, {v[1]}) on {v[2]}"
+                                    for v in _ws['vias']))
+                if _ws.get('welded'):
+                    board.SetModified()
+            except Exception as e:
+                print(f"(stranded-island weld skipped: {e})")
 
         # #521: persist this run's protection-worthy nets (matched groups) and
         # impedance declarations, engine-noted during batch_route. The diff tab
