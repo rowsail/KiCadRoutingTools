@@ -1605,6 +1605,18 @@ class RoutingDialog(wx.Dialog):
             "afterwards. Fewer small drills means a cheaper board. Best on the LAST "
             "routing step, since bigger vias leave less room for later routing.")
         options_inner.Add(self.upsize_pad_vias_check, 0, wx.ALL, 3)
+        self.eliminate_small_vias_check = wx.CheckBox(
+            options_scroll, label="Replace small-drill vias by re-routing (slow)")
+        self.eliminate_small_vias_check.SetValue(False)
+        self.eliminate_small_vias_check.SetToolTip(
+            "After routing, for each via at Board Setup's smallest drill: rip its net "
+            "and the tracks that stop a full-size via (the net class via) from fitting, "
+            "re-route them with small vias forbidden, and reconnect any pour the new "
+            "tracks cut off with full-size vias. A change is kept only if KiCad DRC shows "
+            "no more unconnected items or errors. Many fabs price the board by its "
+            "smallest drill, so removing the last few small vias can cut cost. Takes "
+            "minutes per spot; best on the LAST routing step.")
+        options_inner.Add(self.eliminate_small_vias_check, 0, wx.ALL, 3)
         self.weld_stranded_check = wx.CheckBox(
             options_scroll, label="Weld stranded pour islands with a via")
         self.weld_stranded_check.SetValue(True)
@@ -2843,6 +2855,7 @@ class RoutingDialog(wx.Dialog):
         self.gpu_search_check.SetValue(self.gpu_search_check.IsEnabled())
         self.upsize_pad_vias_check.SetValue(False)
         self.weld_stranded_check.SetValue(True)
+        self.eliminate_small_vias_check.SetValue(False)
         self.upsize_max_pad.SetValue(3.0)
         self.upsize_max_drill.SetValue(0.0)
         # #857/#530: the CLI defaults, from the one place they live.
@@ -3237,6 +3250,7 @@ class RoutingDialog(wx.Dialog):
             'gpu_search': self.gpu_search_check.GetValue(),
             'upsize_pad_vias': self.upsize_pad_vias_check.GetValue(),
             'weld_stranded_pours': self.weld_stranded_check.GetValue(),
+            'eliminate_small_vias': self.eliminate_small_vias_check.GetValue(),
             'upsize_max_pad': self.upsize_max_pad.GetValue(),
             'upsize_max_drill': self.upsize_max_drill.GetValue(),
             'clamp_netclasses': self._ceiling_on(),
@@ -4227,6 +4241,19 @@ class RoutingDialog(wx.Dialog):
                         print(f"    {_c}")
             except Exception as e:
                 print(f"(skipped DRC-settings write-back: {e})")
+
+        # Local addition: replace small-drill vias by re-routing around them
+        # (py_router/small_via_eliminate.py) -- before via growth, so the
+        # re-routed nets' vias in pads are grown too.
+        if config.get('eliminate_small_vias'):
+            try:
+                self._apply_status("Replacing small-drill vias (re-routing)...")
+                from .small_via_gui import run_small_via_pass
+                _sv = run_small_via_pass(board, config, log_fn=print)
+                if _sv:
+                    print(_sv)
+            except Exception as e:
+                print(f"(small-via pass skipped: {e})")
 
         # Local addition: grow vias in small pads (pad_via_upsize.py), then
         # refill so the pours clear the larger barrels.
