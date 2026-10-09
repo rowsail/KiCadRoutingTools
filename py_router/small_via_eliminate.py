@@ -267,6 +267,76 @@ def sweep_dangling(cur, pro_rules, work, base_unc, base_err, rounds=6):
     return removed, unc, err, len(drc.last_dangling)
 
 
+def widen(cur, pro_rules, work, plan_args, base_unc, base_err):
+    """Widen power-net necks (widen_necks.py) one power-net pattern at a
+    time; keep each only if KiCad DRC shows no more unconnected items or
+    errors (a wider track can split a small piece of pour off even when every
+    clearance passes). Returns (widened, base_unc, base_err)."""
+    def _vals(flag):
+        if flag not in plan_args:
+            return []
+        i, out = plan_args.index(flag) + 1, []
+        while i < len(plan_args) and not plan_args[i].startswith('--'):
+            out.append(plan_args[i])
+            i += 1
+        return out
+    nets, widths = _vals('--power-nets'), _vals('--power-nets-widths')
+    if not nets or len(nets) != len(widths):
+        return 0, base_unc, base_err
+    total, kept, skipped = 0, [], []
+    state = {'unc': base_unc, 'err': base_err}
+
+    def attempt(pat, w, rng, tag):
+        """Widen one pattern (optionally a [start, end) slice of its sorted
+        necks) on a copy of cur; keep it if DRC does not get worse.
+        Returns (necks_in_slice, widened_kept)."""
+        cand = os.path.join(work, f'widened_{tag}.kicad_pcb')
+        _with_rules(cur)
+        cmd = [_python(), os.path.join(HERE, 'widen_necks.py'), cur, cand,
+               '--power-nets', pat, '--power-nets-widths', w]
+        if rng:
+            cmd += ['--range', str(rng[0]), str(rng[1])]
+        p = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=KICAD_PY))
+        m = re.search(r'WIDEN necks=(\d+) widened=(\d+) full=(\d+)', p.stdout)
+        if not m or int(m.group(2)) == 0 or not os.path.exists(cand):
+            return (int(m.group(1)) if m else 0), 0
+        _with_rules(cand)
+        unc, err = drc(cand, pro_rules)
+        if unc <= state['unc'] and sum((err - state['err']).values()) == 0:
+            shutil.copy(cand, cur)
+            state['unc'], state['err'] = unc, err
+            return int(m.group(1)), int(m.group(2))
+        return int(m.group(1)), -1
+
+    def bisect(pat, w, lo, hi, depth, tag):
+        """Keep the halves of a failing slice that pass, down to 4 necks."""
+        n, got = attempt(pat, w, (lo, hi), tag)
+        if got >= 0:
+            return max(got, 0)
+        if depth >= 4 or hi - lo <= 4:
+            return 0
+        mid = (lo + hi) // 2
+        return bisect(pat, w, lo, mid, depth + 1, tag + 'a') + bisect(pat, w, mid, hi, depth + 1, tag + 'b')
+
+    for k, (pat, w) in enumerate(zip(nets, widths)):
+        n, got = attempt(pat, w, None, f'{k}')
+        if got > 0:
+            total += got
+            kept.append(f"{pat}:{got}")
+        elif got < 0:
+            part = bisect(pat, w, 0, n, 0, f'{k}s')
+            if part:
+                total += part
+                kept.append(f"{pat}:{part} (partial)")
+            if part < n:
+                skipped.append(pat)
+    base_unc, base_err = state['unc'], state['err']
+    if kept or skipped:
+        print(f"Power necks widened: {total} segment(s) [{' '.join(kept)}]"
+              + (f"; left narrow where DRC got worse: {skipped}" if skipped else ""))
+    return total, base_unc, base_err
+
+
 def count_small(board, max_small_drill):
     t = open(board).read()
     return sum(1 for s, e, k in _blocks(t) if k == 'via' and
@@ -593,6 +663,7 @@ def main():
                 print("   retrying (routing is not fully deterministic)")
         if not accepted:
             print("   kept the original copper here")
+    widened, base_unc, base_err = widen(cur, pro_rules, work, plan_args, base_unc, base_err)
     gone, base_unc, base_err, dang_left = sweep_dangling(cur, pro_rules, work, base_unc, base_err)
     if gone or dang_left:
         print(f"Dangling sweep: removed {gone} dangling via/track stub(s); {dang_left} left")
@@ -603,7 +674,7 @@ def main():
     print(f"\nDone: {base_small} small via(s) left; KiCad unconnected {base_unc}, "
           f"{sum(base_err.values())} error(s). Log: {log}")
     print(f"SVE_RESULT start={start_small} end={base_small} unc_start={start_unc} unc_end={base_unc} "
-          f"swept={gone}")
+          f"swept={gone} widened={widened}")
     shutil.rmtree(work, ignore_errors=True)
 
 

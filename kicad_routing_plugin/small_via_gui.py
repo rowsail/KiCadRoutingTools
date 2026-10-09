@@ -143,7 +143,7 @@ def run_small_via_pass(board, config, log_fn=print):
             if line.startswith(('Start:', '[', '   ', 'Done:')):
                 log_fn(line)
         import re
-        m = re.search(r'SVE_RESULT start=(\d+) end=(\d+)(?: unc_start=(\d+) unc_end=(\d+))?(?: swept=(\d+))?', p.stdout)
+        m = re.search(r'SVE_RESULT start=(\d+) end=(\d+)(?: unc_start=(\d+) unc_end=(\d+))?(?: swept=(\d+))?(?: widened=(\d+))?', p.stdout)
         if not m:
             log_fn("(small-via pass failed: " + (p.stderr.strip().splitlines() or ['no output'])[-1] + ")")
             return None
@@ -151,11 +151,12 @@ def run_small_via_pass(board, config, log_fn=print):
         u0 = int(m.group(3)) if m.group(3) else 0
         u1 = int(m.group(4)) if m.group(4) else u0
         swept = int(m.group(5)) if m.group(5) else 0
-        if (end < start or u1 < u0 or swept) and os.path.exists(out):
+        widened = int(m.group(6)) if m.group(6) else 0
+        if (end < start or u1 < u0 or swept or widened) and os.path.exists(out):
             removed, added = sync_copper(board, out)
             board.SetModified()
             return (f"Small-drill vias: {start} -> {end}; KiCad unconnected: {u0} -> {u1}; "
-                    f"dangling stubs removed: {swept} (copper synced: -{removed} +{added} item(s))")
+                    f"dangling stubs removed: {swept}; power necks widened: {widened} (copper synced: -{removed} +{added} item(s))")
         return f"Small-drill vias: {start} -> {end}; KiCad unconnected: {u0} -> {u1} (no change)"
     finally:
         shutil.rmtree(work, ignore_errors=True)
