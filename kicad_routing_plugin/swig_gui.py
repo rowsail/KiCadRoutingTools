@@ -4265,7 +4265,9 @@ class RoutingDialog(wx.Dialog):
                 self._apply_status("Growing vias in small pads...")
                 from pad_via_upsize import upsize_pad_vias
                 _md = config.get('upsize_max_drill') or None
+                _kp = config.get('same_net_pad_clearance')
                 _us = upsize_pad_vias(board, max_pad_mm=config.get('upsize_max_pad') or 3.0,
+                                      only_exposed=bool(_kp is not None and _kp > 0),
                                       max_drill_mm=_md)
                 print(f"Vias in small pads: {_us['candidates']} found, {_us['grown']} grown"
                       + "".join(f"\n    {n:4d} x {k}" for k, n in
@@ -4284,7 +4286,9 @@ class RoutingDialog(wx.Dialog):
             try:
                 from stranded_pour_vias import weld_stranded_pour_fragments
                 self._apply_status("Checking for stranded pour islands...")
-                _ws = weld_stranded_pour_fragments(board)
+                _kp = config.get('same_net_pad_clearance')
+                _ws = weld_stranded_pour_fragments(
+                    board, pad_keepoff=_kp if (_kp is not None and _kp > 0) else None)
                 if _ws.get('fragments'):
                     print(f"Stranded pour islands: {_ws['fragments']} found, {_ws['welded']} "
                           f"welded (KiCad unconnected {_ws['unconnected_before']} -> "

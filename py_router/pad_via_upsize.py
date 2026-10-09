@@ -64,7 +64,8 @@ def _board_rules(board):
 
 def upsize_pad_vias(board, max_pad_mm: float = 3.0, step_mm: float = 0.05,
                     annular_mm: Optional[float] = None, max_drill_mm: Optional[float] = None,
-                    dry_run: bool = False, verbose: bool = False) -> Dict:
+                    dry_run: bool = False, verbose: bool = False,
+                    only_exposed: bool = False) -> Dict:
     """Grow in-pad vias on `board` in place. Returns a summary dict:
     {'candidates', 'grown', 'unchanged', 'by_size': {(old_d, old_h) -> (new_d, new_h) counts},
      'changes': [(x, y, net, old_d, old_h, new_d, new_h)]}."""
@@ -95,6 +96,10 @@ def upsize_pad_vias(board, max_pad_mm: float = 3.0, step_mm: float = 0.05,
                 continue
             if p.HasHole():
                 continue
+            if only_exposed:
+                from pad_rules import is_exposed_pad
+                if not is_exposed_pad(p):
+                    continue
             sz = p.GetSize(pcbnew.F_Cu) if hasattr(p, 'GetSize') else p.GetSize()
             if max(_mm(sz.x), _mm(sz.y)) > max_pad_mm:
                 continue

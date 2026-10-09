@@ -22,6 +22,8 @@ from typing import Dict, List
 
 import pcbnew
 
+from pad_rules import via_respects_pads
+
 _NM = 1_000_000
 
 
@@ -61,7 +63,7 @@ def _via_fits(board, via, layers, hole_clr_nm, h2h_nm, items) -> bool:
 
 
 def weld_stranded_pour_fragments(board, step_mm: float = 0.025, verbose: bool = False,
-                                 min_via=None) -> Dict:
+                                 min_via=None, pad_keepoff=None) -> Dict:
     """Returns {'fragments': n_found, 'welded': n, 'vias': [(x, y, net, d, h)]}."""
     ds = board.GetDesignSettings()
     layers = list(board.GetEnabledLayers().CuStack())
@@ -151,6 +153,8 @@ def weld_stranded_pour_fragments(board, step_mm: float = 0.025, verbose: bool = 
                 v.SetViaType(pcbnew.VIATYPE_THROUGH)
                 if not _via_fits(board, v, layers, hole_clr, h2h, near):
                     continue
+                if not via_respects_pads(v, pads, pad_keepoff, layers):
+                    continue
                 board.Add(v)
                 _refill(board)
                 after = _unconnected(board)
@@ -171,7 +175,7 @@ def weld_stranded_pour_fragments(board, step_mm: float = 0.025, verbose: bool = 
             # the pad to the nearest legal via site OUTSIDE it (the pad is
             # usually reachable even when its pocket of pour is tiny).
             got = _stub_and_via(board, z, L, hosted, sizes[0], layers, hole_clr, h2h,
-                                items, before, stub_track)
+                                items, before, stub_track, pad_keepoff=pad_keepoff, pads=pads)
             if got:
                 before = got[0]
                 out['welded'] += 1
@@ -184,7 +188,7 @@ def weld_stranded_pour_fragments(board, step_mm: float = 0.025, verbose: bool = 
 
 
 def _stub_and_via(board, z, L, hosted, size, layers, hole_clr, h2h, items, before,
-                  track_w, reach_mm=1.5, step_mm=0.05, max_tries=6):
+                  track_w, reach_mm=1.5, step_mm=0.05, max_tries=6, pad_keepoff=None, pads=()):
     """Pad -> straight track on layer L -> via of `size`; kept only if KiCad's
     unconnected count drops. Returns (new_count, record) or None."""
     d, h = size
@@ -209,6 +213,8 @@ def _stub_and_via(board, z, L, hosted, size, layers, hole_clr, h2h, items, befor
             v.SetNetCode(z.GetNetCode())
             v.SetViaType(pcbnew.VIATYPE_THROUGH)
             if not _via_fits(board, v, layers, hole_clr, h2h, near):
+                continue
+            if not via_respects_pads(v, pads, pad_keepoff, layers):
                 continue
             t = pcbnew.PCB_TRACK(board)
             t.SetStart(c)
@@ -237,13 +243,15 @@ def _stub_and_via(board, z, L, hosted, size, layers, hole_clr, h2h, items, befor
     return None
 
 
-def reserve_escape(board, pad_ids, size_mm, track_mm=0.127, reach_mm=1.5, step_mm=0.05):
+def reserve_escape(board, pad_ids, size_mm, track_mm=0.127, reach_mm=1.5, step_mm=0.05,
+                   pad_keepoff=None):
     """For each pad 'REF.NUM', add the shortest clear straight track on the
     pad's layer to a legal via of size_mm (dia, drill). Used BEFORE re-routing
     signals around a pad that the last attempt caged. Returns the count added."""
     ds = board.GetDesignSettings()
     layers = list(board.GetEnabledLayers().CuStack())
-    items = list(board.GetTracks()) + [p for f in board.GetFootprints() for p in f.Pads()]
+    all_pads = [p for f in board.GetFootprints() for p in f.Pads()]
+    items = list(board.GetTracks()) + all_pads
     added = 0
     for pid in pad_ids:
         ref, num = pid.split('.', 1)
@@ -266,6 +274,8 @@ def reserve_escape(board, pad_ids, size_mm, track_mm=0.127, reach_mm=1.5, step_m
             v.SetNetCode(pad.GetNetCode())
             v.SetViaType(pcbnew.VIATYPE_THROUGH)
             if not _via_fits(board, v, layers, ds.m_HoleClearance, ds.m_HoleToHoleMin, near):
+                continue
+            if not via_respects_pads(v, all_pads, pad_keepoff, layers):
                 continue
             t = pcbnew.PCB_TRACK(board)
             t.SetStart(c)

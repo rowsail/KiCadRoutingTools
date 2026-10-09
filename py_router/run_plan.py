@@ -33,6 +33,41 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+
+
+def _load_site_policies():
+    """Load the user's KiCad site policies for this plugin (local change).
+
+    Files such as ~/.local/share/kicad/<ver>/scripting/plugins/
+    routing_tools_board_rules_policy.py hook the plugin's modules when KiCad
+    starts; a headless plan run never goes through KiCad, so without this it
+    silently ignored them (measured: via-in-pad, which the policy turns off,
+    stayed on and put 166 vias in pads). KRT_NO_SITE_POLICY=1 skips this."""
+    if os.environ.get('KRT_NO_SITE_POLICY') == '1':
+        return
+    import glob
+    import importlib.util
+    roots = []
+    for env in ('KICAD_USER_SCRIPTING_DIR',):
+        if os.environ.get(env):
+            roots.append(os.path.join(os.environ[env], 'plugins'))
+    roots += sorted(glob.glob(os.path.expanduser('~/.local/share/kicad/*/scripting/plugins')),
+                    reverse=True)
+    for root in roots:
+        for path in sorted(glob.glob(os.path.join(root, '*routing_tools*policy*.py'))):
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    os.path.splitext(os.path.basename(path))[0], path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                print(f"Loaded KiCad site policy: {path}")
+            except Exception as e:                             # noqa: BLE001
+                print(f"WARNING: could not load site policy {path}: {e}")
+        if roots and glob.glob(os.path.join(root, '*routing_tools*policy*.py')):
+            break          # newest KiCad version's policies only
+
+
+_load_site_policies()
 import headless_plan
 
 

@@ -1111,6 +1111,11 @@ class PlanesTab(wx.Panel):
                         # (same reasoning as _run_kicad_oracle_after_apply).
                         board_edge_clearance=_gnd_via_edge_clearance(),
                     )
+                    # Via-in-pad policy (#581 keep-off): return vias keep it
+                    # from same-net pads (exposed centre pads exempt).
+                    _snpc = config.get('same_net_pad_clearance')
+                    if _snpc is not None and _snpc > 0:
+                        gnd_config.same_net_pad_clearance = float(_snpc)
                     # Foreign copper at its net class clearance (pairwise
                     # max(Default, class)): without this, return vias were placed
                     # at the run clearance next to e.g. 50R (0.508 mm) copper.

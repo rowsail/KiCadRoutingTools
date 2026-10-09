@@ -135,6 +135,9 @@ def run_small_via_pass(board, config, log_fn=print):
             shutil.copy(dru, os.path.join(work, 'in.kicad_dru'))
         cmd = [_python(), os.path.join(_py_router_dir(), 'small_via_eliminate.py'), inp, out,
                '--route-args', ' '.join(shlex.quote(x) for x in _route_args(config))]
+        _kp = config.get('same_net_pad_clearance')
+        if _kp is not None:
+            cmd += ['--pad-keepoff', str(_kp)]      # -1 = via-in-pad allowed
         env = dict(os.environ)
         env['PYTHONPATH'] = os.pathsep.join(
             [os.path.dirname(pcbnew.__file__)] + ([env['PYTHONPATH']] if env.get('PYTHONPATH') else []))

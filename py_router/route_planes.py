@@ -4614,6 +4614,18 @@ Examples:
         )
         from kicad_dru import install_layer_clearances
         install_layer_clearances(gnd_config, None, None, pcb_data)  # #498
+        # Via-in-pad policy (#581 keep-off): return vias keep it from
+        # same-net pads (exposed centre pads exempt). Flag first, else the
+        # project's record.
+        _snpc = args.same_net_pad_clearance
+        if _snpc is None:
+            try:
+                from protected_nets import read_snpc_for_pcb_data
+                _snpc = read_snpc_for_pcb_data(pcb_data, args.input_file)
+            except Exception:                                  # noqa: BLE001
+                _snpc = None
+        if _snpc is not None and _snpc > 0:
+            gnd_config.same_net_pad_clearance = float(_snpc)
         # Foreign copper at its net class clearance (pairwise max(Default,
         # class)), as the plane taps do: without this, return vias were placed
         # at the run clearance next to e.g. 50R (0.508 mm) copper.

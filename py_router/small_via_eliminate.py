@@ -199,6 +199,7 @@ def drc(board, pro):
         subprocess.run(['kicad-cli', 'pcb', 'drc', '--format', 'json', '--severity-all',
                         '--refill-zones', '-o', rep, b2], capture_output=True)
         j = json.load(open(rep))
+        drc.last_json = j
         errs = collections.Counter(
             (x['type'], tuple(sorted(i['description'][:60] for i in x['items'])))
             for x in j['violations'] if x.get('severity') == 'error')
@@ -372,6 +373,7 @@ def route(inp, out, pro_rules, nets, full, plan_args, rip_existing=None, log=Non
 
 
 _PRO_RULES = None     # the project the pass grades against (set in main)
+_PAD_KEEPOFF = None   # same-net pad keep-off (mm) when via-in-pad is off
 
 
 def _with_rules(board_path):
@@ -392,10 +394,10 @@ def weld(board_path, full):
     code = ("import sys, pcbnew; sys.path.insert(0, %r)\n"
             "from stranded_pour_vias import weld_stranded_pour_fragments\n"
             "b = pcbnew.LoadBoard(%r)\n"
-            "s = weld_stranded_pour_fragments(b, min_via=%r)\n"
+            "s = weld_stranded_pour_fragments(b, min_via=%r, pad_keepoff=%r)\n"
             "print('WELD', s['fragments'], s['welded'])\n"
             "print('STRANDED', ' '.join(s.get('stranded_pads', [])))\n"
-            "pcbnew.SaveBoard(%r, b) if s['welded'] else None\n") % (HERE, board_path, tuple(full), board_path)
+            "pcbnew.SaveBoard(%r, b) if s['welded'] else None\n") % (HERE, board_path, tuple(full), _PAD_KEEPOFF, board_path)
     p = subprocess.run([_python(), '-c', code], capture_output=True, text=True,
                        env=dict(os.environ, PYTHONPATH=KICAD_PY))
     m = re.search(r'WELD (\d+) (\d+)', p.stdout)
@@ -468,6 +470,86 @@ def stranded_groups(board_path, full, work, max_island_mm2=2.0, reach_mm=1.5):
     return groups
 
 
+def keepoff_violations(board_path):
+    """[(via net, x, y, plane?)] for vias that break the same-net pad keep-off
+    (exposed centre pads exempt). Empty when via-in-pad is allowed."""
+    if not _PAD_KEEPOFF:
+        return []
+    _with_rules(board_path)
+    code = ("import sys, json, pcbnew; sys.path.insert(0, %r)\n"
+            "from pad_rules import via_respects_pads\n"
+            "b = pcbnew.LoadBoard(%r)\n"
+            "layers = list(b.GetEnabledLayers().CuStack())\n"
+            "pads = [p for f in b.GetFootprints() for p in f.Pads()]\n"
+            "zn = {z.GetNetname() for z in b.Zones() if not z.GetIsRuleArea() and z.GetNetCode() > 0}\n"
+            "out = [(v.GetNetname(), v.GetPosition().x / 1e6, v.GetPosition().y / 1e6, v.GetNetname() in zn)\n"
+            "       for v in b.GetTracks() if v.GetClass() == 'PCB_VIA'\n"
+            "       and not via_respects_pads(v, pads, %r, layers)]\n"
+            "print('KEEPOFF ' + json.dumps(out))\n") % (HERE, board_path, _PAD_KEEPOFF)
+    p = subprocess.run([_python(), '-c', code], capture_output=True, text=True,
+                       env=dict(os.environ, PYTHONPATH=KICAD_PY))
+    m = re.search(r'KEEPOFF (.*)', p.stdout)
+    return [tuple(x) for x in json.loads(m.group(1))] if m else []
+
+
+def repair_groups(board_path, zone_nets):
+    """Groups for what the last DRC (drc.last_json) and the keep-off check
+    report: keep-off violators, unconnected signal nets, starved thermal pads.
+    Each rips only the nets involved."""
+    groups = []
+    for net, x, y, plane in keepoff_violations(board_path):
+        v = {'net': net, 'x': x, 'y': y, 'plane': plane, 'blockers': set(), 'pad_block': False,
+             'in_pad': True}
+        groups.append({'vias': [v], 'rip': set() if plane else {net}, 'repair': 'keep-off',
+                       'label': f"via in/at a {net} pad @({x:.2f},{y:.2f})"})
+    j = getattr(drc, 'last_json', {}) or {}
+    seen = set()
+    for x in j.get('unconnected_items', []):
+        for it in x['items']:
+            m = re.search(r'\[([^\]]*)\]', it['description'])
+            if m and m.group(1) not in zone_nets and m.group(1) not in seen:
+                seen.add(m.group(1))
+                groups.append({'vias': [], 'rip': {m.group(1)}, 'repair': 'unconnected',
+                               'label': f"unconnected {m.group(1)}",
+                               'pt': (it['pos']['x'], it['pos']['y'])})
+    for x in j.get('violations', []):
+        if x['type'] != 'starved_thermal':
+            continue
+        pad = next((i for i in x['items'] if i['description'].startswith('Pad')), None)
+        if pad is None:
+            continue
+        near = signal_nets_near(board_path, pad['pos']['x'], pad['pos']['y'], 0.6, zone_nets)
+        if near:
+            groups.append({'vias': [], 'rip': set(near), 'repair': 'starved thermal',
+                           'label': f"starved thermal {pad['description'][:40]}",
+                           'pt': (pad['pos']['x'], pad['pos']['y'])})
+    return groups
+
+
+def signal_nets_near(board_path, x, y, radius_mm, zone_nets):
+    """Signal nets with track copper within radius_mm of (x, y)."""
+    t = open(board_path).read()
+    out = set()
+    for s0, e0, kind in _blocks(t):
+        if kind == 'via':
+            continue
+        blk = t[s0:e0]
+        net = re.search(r'\(net "([^"]*)"\)', blk)
+        if not net or net.group(1) in zone_nets:
+            continue
+        pts = [(float(a), float(b)) for a, b in re.findall(r'\((?:start|end) ([-\d.]+) ([-\d.]+)\)', blk)]
+        w = float(re.search(r'\(width ([\d.]+)\)', blk).group(1)) if '(width' in blk else 0
+        if len(pts) == 2:
+            (x1, y1), (x2, y2) = pts
+            dx, dy = x2 - x1, y2 - y1
+            L2 = dx * dx + dy * dy
+            u = 0 if L2 == 0 else max(0, min(1, ((x - x1) * dx + (y - y1) * dy) / L2))
+            d = ((x1 + u * dx - x) ** 2 + (y1 + u * dy - y) ** 2) ** 0.5 - w / 2
+            if d < radius_mm:
+                out.add(net.group(1))
+    return sorted(out)
+
+
 def pads_near(board_path, pts, radius_mm):
     """{'REF.NUM'} of pads within radius_mm of any of pts [(x, y) mm]."""
     sys.path.insert(0, KICAD_PY)
@@ -488,9 +570,9 @@ def reserve(board_path, pad_ids, full):
     code = ("import sys, pcbnew; sys.path.insert(0, %r)\n"
             "from stranded_pour_vias import reserve_escape\n"
             "b = pcbnew.LoadBoard(%r)\n"
-            "n = reserve_escape(b, %r, %r)\n"
+            "n = reserve_escape(b, %r, %r, pad_keepoff=%r)\n"
             "print('RESERVED', n)\n"
-            "pcbnew.SaveBoard(%r, b) if n else None\n") % (HERE, board_path, list(pad_ids), tuple(full), board_path)
+            "pcbnew.SaveBoard(%r, b) if n else None\n") % (HERE, board_path, list(pad_ids), tuple(full), _PAD_KEEPOFF, board_path)
     p = subprocess.run([_python(), '-c', code], capture_output=True, text=True,
                        env=dict(os.environ, PYTHONPATH=KICAD_PY))
     m = re.search(r'RESERVED (\d+)', p.stdout)
@@ -535,6 +617,9 @@ def main():
     ap.add_argument('input')
     ap.add_argument('output')
     ap.add_argument('--plan', help='plan JSON to take route parameters from')
+    ap.add_argument('--pad-keepoff', type=float, default=None,
+                    help='same-net pad keep-off in mm (via-in-pad off when > 0; -1 = allowed). '
+                         'Default: the project\'s kicad_routing_tools.same_net_pad_clearance')
     ap.add_argument('--route-args', default=None,
                     help='route.py arguments as one string (overrides --plan)')
     ap.add_argument('--max-small-drill', type=float, default=None,
@@ -550,8 +635,14 @@ def main():
     open(log, 'w').close()
     cur = os.path.join(work, 'cur.kicad_pcb')
     shutil.copy(a.input, cur)
-    global _PRO_RULES
+    global _PRO_RULES, _PAD_KEEPOFF
     _PRO_RULES = pro_rules
+    if a.pad_keepoff is None:
+        from pad_rules import project_pad_keepoff
+        a.pad_keepoff = project_pad_keepoff(pro_rules)
+    _PAD_KEEPOFF = a.pad_keepoff if (a.pad_keepoff or 0) > 0 else None
+    print("Via-in-pad: " + (f"OFF (vias keep {_PAD_KEEPOFF} mm from same-net pads; "
+                            f"exposed centre pads exempt)" if _PAD_KEEPOFF else "allowed"))
     _with_rules(cur)
     import shlex
     plan_args = shlex.split(a.route_args) if a.route_args else plan_route_args(a.plan)
@@ -573,6 +664,20 @@ def main():
           f"{sum(base_err.values())} error(s)")
     vias = analyse(cur, a.max_small_drill, full)
     groups = group(vias)
+    zone_nets = set()
+    try:
+        _t = open(cur).read()
+        for _m in re.finditer(r'\n\t\(zone\b', _t):
+            _n = re.search(r'\((?:net_name|net) "([^"]+)"\)', _t[_m.start():_m.start() + 400])
+            if _n:
+                zone_nets.add(_n.group(1))
+    except Exception:                                          # noqa: BLE001
+        pass
+    base_viol = len(keepoff_violations(cur))
+    drc(cur, pro_rules)
+    groups += repair_groups(cur, zone_nets)
+    if base_viol:
+        print(f"Via-in-pad keep-off violations: {base_viol}")
     if base_unc > 0:
         sg = stranded_groups(cur, full, work)
         for g in sg:
@@ -580,7 +685,7 @@ def main():
                   f"escape needs {sorted(g['rip'])} moved")
         groups += sg
     for gi, g in enumerate(groups, 1):
-        names = ', '.join(f"{v['net']} @({v['x']:.2f},{v['y']:.2f})" for v in g['vias']) or \
+        names = g.get('label') or ', '.join(f"{v['net']} @({v['x']:.2f},{v['y']:.2f})" for v in g['vias']) or \
             f"boxed-in pad {g['pads'][0]}"
         plane_vias = [(v['net'], v['x'], v['y']) for v in g['vias'] if v['plane']]
         # Plane nets are never handed to route.py here: routing a whole pour
@@ -609,8 +714,10 @@ def main():
             # A via that already sat in a pad may sit in a pad again (it is
             # filled and capped either way); otherwise the project's same-net
             # pad keep-out seals pads that have no other via site in reach.
+            # Via-in-pad only where the board allows it: with a keep-off the
+            # project's own setting reaches route.py through the .kicad_pro.
             extra = (['--same-net-pad-clearance', '0']
-                     if any(v['in_pad'] for v in g['vias']) else [])
+                     if not _PAD_KEEPOFF and any(v['in_pad'] for v in g['vias']) else [])
             # Plane nets first, on their own: a pad that must escape the pour
             # gap (e.g. a GND pad between signal pins) gets its path before
             # the ripped signal nets are laid back around it.
@@ -640,7 +747,16 @@ def main():
                 # not this group's business.
                 caged = [pid for pid in getattr(weld, 'stranded', [])
                          if pid not in reserved and pid in near_pads]
-                gain = (unc < base_unc and small <= base_small) if g.get('pads') else \
+                if g.get('repair'):
+                    viol = len(keepoff_violations(outp)) if _PAD_KEEPOFF else 0
+                    better = (unc < base_unc or sum(err.values()) < sum(base_err.values())
+                              or viol < base_viol)
+                    gain = better and unc <= base_unc and small <= base_small and viol <= base_viol
+                    if gain:
+                        base_viol = viol
+                else:
+                    gain = None
+                gain = gain if gain is not None else (unc < base_unc and small <= base_small) if g.get('pads') else \
                     (unc <= base_unc and small < base_small)
                 # Any attempt that did not pass and boxed in a nearby pad: give
                 # that pad its escape before the next attempt (an unchanged

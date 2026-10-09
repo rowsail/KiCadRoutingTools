@@ -195,6 +195,17 @@ def add_gnd_vias_to_existing_board(
                    _vd / 2 + config.via_drill / 2 + config.hole_to_hole_clearance)
     _via_min = np.array([_via_pair_min(v) for v in pcb_data.vias], dtype=np.float64)
 
+    # Via-in-pad policy (local change): with a same-net pad keep-off active
+    # (config.same_net_pad_clearance > 0), a return via keeps that distance
+    # from every ground pad except a part's exposed centre pad.
+    _keepoff = getattr(config, 'same_net_pad_clearance', -1.0) or -1.0
+    _gpads = []
+    if _keepoff > 0:
+        from pad_rules import exposed_parser_pads
+        _exp = exposed_parser_pads(pcb_data)
+        _gpads = [p for nid in ground_ids for p in pcb_data.pads_by_net.get(nid, [])
+                  if not ((getattr(p, 'drill', 0) or 0) > 0) and id(p) not in _exp]
+
     # Exact copper check (local change). The obstacle-map test below works on
     # grid CELLS and, at the plan's 0.1 mm grid, passed vias up to ~0.03 mm
     # inside a track/pad clearance; it also cannot see a class clearance wider
@@ -301,6 +312,12 @@ def add_gnd_vias_to_existing_board(
         _ok, _why = _exact_copper_clear(x_mm, y_mm)
         if not _ok:
             return (False, _why)
+        if _gpads:
+            for _p in _gpads:
+                if abs(_p.global_x - x_mm) > 3 or abs(_p.global_y - y_mm) > 3:
+                    continue
+                if point_to_pad_distance(x_mm, y_mm, _p) - config.via_size / 2 < _keepoff:
+                    return (False, f"same_net_pad_keepoff_{_p.component_ref}.{_p.pad_number}")
 
         # Check via-to-via clearance for OTHER vias (skip the signal via we're
         # targeting). Broadcast nominates (band around the strict < threshold

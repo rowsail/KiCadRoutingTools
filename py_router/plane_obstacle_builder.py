@@ -532,7 +532,15 @@ def build_via_obstacle_map(
         if is_target_net and same_net_pad_clearance < 0:
             continue
         pad_clearance = same_net_pad_clearance if is_target_net else None
+        if is_target_net and same_net_pad_clearance > 0 and '_exposed' not in locals():
+            from pad_rules import exposed_parser_pads
+            _exposed = exposed_parser_pads(pcb_data)
         for pad in pads:
+            # Local: with via-in-pad off, a part's exposed centre pad still
+            # takes thermal / ground vias (normal practice); every other
+            # same-net pad keeps the keep-off.
+            if is_target_net and same_net_pad_clearance > 0 and id(pad) in _exposed:
+                continue
             _add_pad_via_obstacle(obstacles, pad, coord, config, clearance_override=pad_clearance)
             pad_count += 1
     if verbose:
