@@ -1,9 +1,11 @@
 """Eliminate small-drill vias by ripping and re-routing around them.
 
 Many fabs price a board by its SMALLEST drill, so a handful of 0.15 mm vias
-can cost as much as hundreds. For each via whose drill is <= --max-small-drill:
+can cost as much as hundreds. 'Small' and 'full size' come from Board Setup:
+any via drilled below its minimum drill is small, and the replacement is its
+minimum via (at least 0.45/0.2). For each small via:
 
-  1. Find what stops a full-size via (the net's class via, else 0.45/0.2)
+  1. Find what stops a full-size via
      from sitting where it is: the foreign TRACKS that collide with it, using
      KiCad's own shapes and pairwise clearance. Pads cannot move and are not
      ripped.
@@ -241,8 +243,24 @@ def route(inp, out, pro_rules, nets, full, plan_args, rip_existing=None, log=Non
     return p.returncode == 0 and os.path.exists(out), sorted(set(hints))
 
 
+_PRO_RULES = None     # the project the pass grades against (set in main)
+
+
+def _with_rules(board_path):
+    """Make sure the project rules sit next to a board pcbnew will load: without
+    a sibling .kicad_pro, LoadBoard falls back to KiCad's default rules."""
+    if _PRO_RULES:
+        base = os.path.splitext(board_path)[0]
+        if os.path.abspath(base + '.kicad_pro') != os.path.abspath(_PRO_RULES):
+            shutil.copy(_PRO_RULES, base + '.kicad_pro')
+            dru = os.path.splitext(_PRO_RULES)[0] + '.kicad_dru'
+            if os.path.exists(dru):
+                shutil.copy(dru, base + '.kicad_dru')
+
+
 def weld(board_path, full):
     """Weld pour islands the re-route cut off, with full-size vias only."""
+    _with_rules(board_path)
     code = ("import sys, pcbnew; sys.path.insert(0, %r)\n"
             "from stranded_pour_vias import weld_stranded_pour_fragments\n"
             "b = pcbnew.LoadBoard(%r)\n"
@@ -256,6 +274,70 @@ def weld(board_path, full):
     st = re.search(r'STRANDED ?(.*)', p.stdout)
     weld.stranded = (st.group(1).split() if st else [])
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
+def stranded_groups(board_path, full, work, max_island_mm2=2.0, reach_mm=1.5):
+    """Groups for plane-net pads boxed in by signal tracks: the welder found
+    their pour island but could not reach any full-size via from it. For each
+    such pad (island under max_island_mm2 -- big islands are tied in by other
+    copper), pick the escape direction blocked ONLY by signal tracks (no pads,
+    no plane copper) with the fewest nets, and rip those nets."""
+    import math
+    tmp = os.path.join(work, 'strand_probe.kicad_pcb')
+    shutil.copy(board_path, tmp)
+    weld(tmp, full)
+    _with_rules(board_path)
+    pad_ids = list(getattr(weld, 'stranded', []))
+    if not pad_ids:
+        return []
+    sys.path.insert(0, KICAD_PY)
+    import pcbnew
+    b = pcbnew.LoadBoard(board_path)
+    pcbnew.ZONE_FILLER(b).Fill(b.Zones())
+    zone_nets = {z.GetNetname() for z in b.Zones() if not z.GetIsRuleArea() and z.GetNetCode() > 0}
+    items = list(b.GetTracks()) + [p for f in b.GetFootprints() for p in f.Pads()]
+    groups = []
+    for pid in pad_ids:
+        ref, num = pid.split('.', 1)
+        fp = b.FindFootprintByReference(ref)
+        pad = next((p for p in fp.Pads() if p.GetNumber() == num), None) if fp else None
+        if pad is None:
+            continue
+        c = pad.GetPosition()
+        L = next((l for l in b.GetEnabledLayers().CuStack() if pad.IsOnLayer(l)), None)
+        area = None
+        for z in b.Zones():
+            if z.GetNetCode() == pad.GetNetCode() and z.IsOnLayer(L) and not z.GetIsRuleArea():
+                fps = z.GetFilledPolysList(L)
+                for i in range(fps.OutlineCount()):
+                    if fps.Contains(c, i):
+                        area = fps.Outline(i).Area() / 1e12
+        if area is None or area > max_island_mm2:
+            continue
+        near = [it for it in items if it.GetNetCode() != pad.GetNetCode() and it.IsOnLayer(L)
+                and abs(it.GetBoundingBox().Centre().x - c.x) < (reach_mm + 2) * 1e6
+                and abs(it.GetBoundingBox().Centre().y - c.y) < (reach_mm + 2) * 1e6]
+        best = None
+        for deg in range(0, 360, 15):
+            a = math.radians(deg)
+            t = pcbnew.PCB_TRACK(b)
+            t.SetStart(c)
+            t.SetEnd(pcbnew.VECTOR2I(c.x + int(reach_mm * 1e6 * math.cos(a)), c.y + int(reach_mm * 1e6 * math.sin(a))))
+            t.SetWidth(127000)
+            t.SetLayer(L)
+            t.SetNetCode(pad.GetNetCode())
+            sh = t.GetEffectiveShape(L)
+            hits = [it for it in near if sh.Collide(it.GetEffectiveShape(L),
+                                                    max(t.GetOwnClearance(L), it.GetOwnClearance(L)))]
+            if any(it.GetClass() == 'PAD' or it.GetNetname() in zone_nets for it in hits):
+                continue
+            nets = {it.GetNetname() for it in hits}
+            if best is None or len(nets) < len(best):
+                best = nets
+        if best:
+            groups.append({'vias': [], 'pads': [pid], 'rip': set(best),
+                           'pt': (c.x / 1e6, c.y / 1e6), 'island': area})
+    return groups
 
 
 def pads_near(board_path, pts, radius_mm):
@@ -274,6 +356,7 @@ def pads_near(board_path, pts, radius_mm):
 
 def reserve(board_path, pad_ids, full):
     """Give caged pads a stub + full-size via on the PRE-route board."""
+    _with_rules(board_path)
     code = ("import sys, pcbnew; sys.path.insert(0, %r)\n"
             "from stranded_pour_vias import reserve_escape\n"
             "b = pcbnew.LoadBoard(%r)\n"
@@ -284,6 +367,15 @@ def reserve(board_path, pad_ids, full):
                        env=dict(os.environ, PYTHONPATH=KICAD_PY))
     m = re.search(r'RESERVED (\d+)', p.stdout)
     return int(m.group(1)) if m else 0
+
+
+def board_via_minimum(pro_path):
+    """(min via diameter, min drill) mm from the project's Board Setup, or (0, 0)."""
+    try:
+        r = json.load(open(pro_path))['board']['design_settings']['rules']
+        return float(r.get('min_via_diameter') or 0), float(r.get('min_through_hole_diameter') or 0)
+    except Exception:                                          # noqa: BLE001
+        return 0.0, 0.0
 
 
 def plan_route_args(plan_path):
@@ -317,8 +409,10 @@ def main():
     ap.add_argument('--plan', help='plan JSON to take route parameters from')
     ap.add_argument('--route-args', default=None,
                     help='route.py arguments as one string (overrides --plan)')
-    ap.add_argument('--max-small-drill', type=float, default=0.15)
-    ap.add_argument('--full-via', type=float, nargs=2, default=(0.45, 0.2),
+    ap.add_argument('--max-small-drill', type=float, default=None,
+                    help='drills at or below this count as small (default: anything '
+                         'below Board Setup\'s minimum drill; 0.15 if that is not set above it)')
+    ap.add_argument('--full-via', type=float, nargs=2, default=None,
                     metavar=('DIA', 'DRILL'))
     a = ap.parse_args()
 
@@ -328,19 +422,38 @@ def main():
     open(log, 'w').close()
     cur = os.path.join(work, 'cur.kicad_pcb')
     shutil.copy(a.input, cur)
+    global _PRO_RULES
+    _PRO_RULES = pro_rules
+    _with_rules(cur)
     import shlex
     plan_args = shlex.split(a.route_args) if a.route_args else plan_route_args(a.plan)
+    bs_via, bs_drill = board_via_minimum(pro_rules)
+    if a.full_via is None:
+        # Board Setup's minimum via is the smallest the fab wants; use it as
+        # the replacement size when it is at least the classic 0.45/0.2.
+        a.full_via = (max(bs_via, 0.45), max(bs_drill, 0.2))
+    if a.max_small_drill is None:
+        a.max_small_drill = max(0.15, round(a.full_via[1] - 0.01, 4))
     full = tuple(a.full_via)
+    print(f"Small = drill <= {a.max_small_drill} mm; replacement via {full[0]}/{full[1]} mm")
 
     base_unc, base_err = drc(cur, pro_rules)
     base_small = count_small(cur, a.max_small_drill)
     start_small = base_small
+    start_unc = base_unc
     print(f"Start: {base_small} small via(s); KiCad unconnected {base_unc}, "
           f"{sum(base_err.values())} error(s)")
     vias = analyse(cur, a.max_small_drill, full)
     groups = group(vias)
+    if base_unc > 0:
+        sg = stranded_groups(cur, full, work)
+        for g in sg:
+            print(f"Boxed-in pad {g['pads'][0]} (pour island {g['island']:.2f} mm^2): "
+                  f"escape needs {sorted(g['rip'])} moved")
+        groups += sg
     for gi, g in enumerate(groups, 1):
-        names = ', '.join(f"{v['net']} @({v['x']:.2f},{v['y']:.2f})" for v in g['vias'])
+        names = ', '.join(f"{v['net']} @({v['x']:.2f},{v['y']:.2f})" for v in g['vias']) or \
+            f"boxed-in pad {g['pads'][0]}"
         plane_vias = [(v['net'], v['x'], v['y']) for v in g['vias'] if v['plane']]
         # Plane nets are never handed to route.py here: routing a whole pour
         # net re-checks every one of its pads board-wide and, with small vias
@@ -357,7 +470,12 @@ def main():
         accepted = False
         rip_existing = None
         reserved = set()
-        near_pads = pads_near(cur, [(v['x'], v['y']) for v in g['vias']], 3.0)
+        if g.get('pads'):
+            # A boxed-in pad: give it its escape BEFORE the signals go back.
+            nres = reserve(stripped, g['pads'], full)
+            reserved.update(g['pads'])
+            print(f"   reserved {nres} full-size escape(s) for {g['pads']}")
+        near_pads = pads_near(cur, [(v['x'], v['y']) for v in g['vias']] + ([g['pt']] if g.get('pt') else []), 3.0)
         for attempt in (1, 2, 3):
             outp = os.path.join(work, f'g{gi}_a{attempt}.kicad_pcb')
             # A via that already sat in a pad may sit in a pad again (it is
@@ -394,11 +512,16 @@ def main():
                 # not this group's business.
                 caged = [pid for pid in getattr(weld, 'stranded', [])
                          if pid not in reserved and pid in near_pads]
-                if unc > base_unc and caged and attempt < 3:
+                gain = (unc < base_unc and small <= base_small) if g.get('pads') else \
+                    (unc <= base_unc and small < base_small)
+                # Any attempt that did not pass and boxed in a nearby pad: give
+                # that pad its escape before the next attempt (an unchanged
+                # count can hide one pad fixed and another newly caged).
+                if not (gain and worse == 0) and caged and attempt < 3:
                     nres = reserve(stripped, caged, full)
                     reserved.update(caged)
                     print(f"   caged pad(s) {caged}: reserved {nres} full-size escape(s) before the next attempt")
-                if unc <= base_unc and worse == 0 and small < base_small:
+                if gain and worse == 0:
                     shutil.copy(outp, cur)
                     base_unc, base_err, base_small = unc, err, small
                     accepted = True
@@ -418,7 +541,7 @@ def main():
         shutil.copy(pro_rules, out_pro)
     print(f"\nDone: {base_small} small via(s) left; KiCad unconnected {base_unc}, "
           f"{sum(base_err.values())} error(s). Log: {log}")
-    print(f"SVE_RESULT start={start_small} end={base_small}")
+    print(f"SVE_RESULT start={start_small} end={base_small} unc_start={start_unc} unc_end={base_unc}")
     shutil.rmtree(work, ignore_errors=True)
 
 

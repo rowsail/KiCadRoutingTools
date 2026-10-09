@@ -331,9 +331,13 @@ def _apply_board_via_capability(rungs, copper_layer_count):
     phys = _layer_floors(copper_layer_count)['advanced']
     cap = {k: max(float(bf[k]), phys[k]) for k in ('via_diameter', 'via_drill')
            if bf.get(k) is not None}
-    # Capability mode only when the board declares a SMALLER via than the
-    # tier's nominal floor; otherwise the ladder is exactly the tier's.
-    if not cap or not any(rungs[0][k] > v + 1e-9 for k, v in cap.items()):
+    # Board Setup's via minimum is the via floor at every rung, in BOTH
+    # directions (local change): a smaller declared via lowers the rungs (the
+    # fab can drill it), a larger one raises them (the designer does not want
+    # anything smaller -- measured: with Board Setup at 0.45/0.3 the 'auto'
+    # ladder still descended to 0.45/0.20 and 0.30/0.15 vias). A stale stock
+    # minimum is dropped beforehand by drop_stale_board_floors.
+    if not cap or not any(abs(r[k] - v) > 1e-9 for r in rungs for k, v in cap.items()):
         return rungs
     out = []
     for r in rungs:
@@ -352,10 +356,10 @@ def _apply_board_via_capability(rungs, copper_layer_count):
             key = (rr['via_diameter'], rr['via_drill'])
             if key not in _board_via_said:
                 _board_via_said.add(key)
-                print(f"  Board Setup declares vias down to {rr['via_diameter']:g}/"
-                      f"{rr['via_drill']:g} mm: using that as the fab's via capability "
-                      f"(net-class vias at that size are honoured; tracks and "
-                      f"clearances keep the fab tier's floors)")
+                print(f"  Board Setup's minimum via is {rr['via_diameter']:g}/"
+                      f"{rr['via_drill']:g} mm: no via will be smaller (it is the via "
+                      f"floor at every escalation rung; tracks and clearances keep "
+                      f"the fab tier's floors)")
         if not out or rr != out[-1]:
             out.append(rr)
     return out
@@ -948,5 +952,11 @@ def set_policy_from_args(args, pcb_path=None):
     if policy == 'board':
         floors = drop_stale_board_floors(
             floors, {k: getattr(args, k, None) for k in _REQUEST_FLOOR_KEY})
+    else:
+        # The via floor applies under every policy (_apply_board_via_capability),
+        # so a stale via minimum must be dropped under every policy too.
+        floors = drop_stale_board_floors(
+            floors, {k: getattr(args, k, None) for k in ('via_size', 'via_diameter', 'via_drill')},
+            announce=False)
     set_escalation_policy(policy, floors)
     return floors

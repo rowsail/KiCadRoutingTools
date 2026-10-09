@@ -114,10 +114,23 @@ def run_small_via_pass(board, config, log_fn=print):
     if not os.path.exists(pro):
         log_fn(f"(small-via pass skipped: no project file {pro})")
         return None
+    # Small = below Board Setup's minimum drill (never counting > 0.15 mm
+    # vias as small when the minimum is left at or below 0.2).
+    min_drill = board.GetDesignSettings().m_MinThroughDrill or 0
+    limit = max(150000, min_drill - 10000)
     small = sum(1 for t in board.GetTracks()
-                if t.GetClass() == 'PCB_VIA' and t.GetDrillValue() <= 150000)
+                if t.GetClass() == 'PCB_VIA' and t.GetDrillValue() <= limit)
     if small == 0:
-        return None           # nothing to do: skip the (slow) DRC baseline
+        # No small vias: still worth running when KiCad reports unconnected
+        # items (the pass also repairs plane-net pads boxed in by signal
+        # tracks); otherwise skip the slow DRC baseline.
+        try:
+            pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+            board.BuildConnectivity()
+            if board.GetConnectivity().GetUnconnectedCount(False) == 0:
+                return None
+        except Exception:                                      # noqa: BLE001
+            return None
     work = tempfile.mkdtemp(prefix='krt_sve_')
     try:
         inp = os.path.join(work, 'in.kicad_pcb')
@@ -139,16 +152,18 @@ def run_small_via_pass(board, config, log_fn=print):
             if line.startswith(('Start:', '[', '   ', 'Done:')):
                 log_fn(line)
         import re
-        m = re.search(r'SVE_RESULT start=(\d+) end=(\d+)', p.stdout)
+        m = re.search(r'SVE_RESULT start=(\d+) end=(\d+)(?: unc_start=(\d+) unc_end=(\d+))?', p.stdout)
         if not m:
             log_fn("(small-via pass failed: " + (p.stderr.strip().splitlines() or ['no output'])[-1] + ")")
             return None
         start, end = int(m.group(1)), int(m.group(2))
-        if end < start and os.path.exists(out):
+        u0 = int(m.group(3)) if m.group(3) else 0
+        u1 = int(m.group(4)) if m.group(4) else u0
+        if (end < start or u1 < u0) and os.path.exists(out):
             removed, added = sync_copper(board, out)
             board.SetModified()
-            return (f"Small-drill vias: {start} -> {end} "
+            return (f"Small-drill vias: {start} -> {end}; KiCad unconnected: {u0} -> {u1} "
                     f"(copper synced: -{removed} +{added} item(s))")
-        return f"Small-drill vias: {start} -> {end} (no change)"
+        return f"Small-drill vias: {start} -> {end}; KiCad unconnected: {u0} -> {u1} (no change)"
     finally:
         shutil.rmtree(work, ignore_errors=True)
