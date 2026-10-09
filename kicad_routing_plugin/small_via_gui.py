@@ -120,17 +120,8 @@ def run_small_via_pass(board, config, log_fn=print):
     limit = max(150000, min_drill - 10000)
     small = sum(1 for t in board.GetTracks()
                 if t.GetClass() == 'PCB_VIA' and t.GetDrillValue() <= limit)
-    if small == 0:
-        # No small vias: still worth running when KiCad reports unconnected
-        # items (the pass also repairs plane-net pads boxed in by signal
-        # tracks); otherwise skip the slow DRC baseline.
-        try:
-            pcbnew.ZONE_FILLER(board).Fill(board.Zones())
-            board.BuildConnectivity()
-            if board.GetConnectivity().GetUnconnectedCount(False) == 0:
-                return None
-        except Exception:                                      # noqa: BLE001
-            return None
+    # No quick skip: besides small vias the pass repairs boxed-in plane pads
+    # and sweeps dangling copper, which only KiCad's DRC sees reliably.
     work = tempfile.mkdtemp(prefix='krt_sve_')
     try:
         inp = os.path.join(work, 'in.kicad_pcb')
@@ -152,18 +143,19 @@ def run_small_via_pass(board, config, log_fn=print):
             if line.startswith(('Start:', '[', '   ', 'Done:')):
                 log_fn(line)
         import re
-        m = re.search(r'SVE_RESULT start=(\d+) end=(\d+)(?: unc_start=(\d+) unc_end=(\d+))?', p.stdout)
+        m = re.search(r'SVE_RESULT start=(\d+) end=(\d+)(?: unc_start=(\d+) unc_end=(\d+))?(?: swept=(\d+))?', p.stdout)
         if not m:
             log_fn("(small-via pass failed: " + (p.stderr.strip().splitlines() or ['no output'])[-1] + ")")
             return None
         start, end = int(m.group(1)), int(m.group(2))
         u0 = int(m.group(3)) if m.group(3) else 0
         u1 = int(m.group(4)) if m.group(4) else u0
-        if (end < start or u1 < u0) and os.path.exists(out):
+        swept = int(m.group(5)) if m.group(5) else 0
+        if (end < start or u1 < u0 or swept) and os.path.exists(out):
             removed, added = sync_copper(board, out)
             board.SetModified()
-            return (f"Small-drill vias: {start} -> {end}; KiCad unconnected: {u0} -> {u1} "
-                    f"(copper synced: -{removed} +{added} item(s))")
+            return (f"Small-drill vias: {start} -> {end}; KiCad unconnected: {u0} -> {u1}; "
+                    f"dangling stubs removed: {swept} (copper synced: -{removed} +{added} item(s))")
         return f"Small-drill vias: {start} -> {end}; KiCad unconnected: {u0} -> {u1} (no change)"
     finally:
         shutil.rmtree(work, ignore_errors=True)

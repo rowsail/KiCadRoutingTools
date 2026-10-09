@@ -202,11 +202,69 @@ def drc(board, pro):
         errs = collections.Counter(
             (x['type'], tuple(sorted(i['description'][:60] for i in x['items'])))
             for x in j['violations'] if x.get('severity') == 'error')
+        drc.last_dangling = [(x['type'], i['description'], i['pos']['x'], i['pos']['y'])
+                             for x in j['violations'] if x['type'] in ('via_dangling', 'track_dangling')
+                             for i in x['items']]
         drc.last_unconnected = [' <-> '.join(f"{i['description'][:50]} @({i['pos']['x']:.2f},{i['pos']['y']:.2f})"
                                              for i in x['items']) for x in j.get('unconnected_items', [])]
         return len(j.get('unconnected_items', [])), errs
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def sweep_dangling(cur, pro_rules, work, base_unc, base_err, rounds=6):
+    """Remove the vias / track stubs KiCad's DRC reports as dangling, one
+    round at a time (a removed stub can expose the next), keeping a round
+    only if unconnected items and errors do not rise. Returns
+    (removed, base_unc, base_err, dangling_left)."""
+    removed = 0
+    unc, err = drc(cur, pro_rules)
+    for rnd in range(rounds):
+        dang = list(drc.last_dangling)
+        if not dang:
+            break
+        text = open(cur).read()
+        out, last, n = [], 0, 0
+        for s0, e0, kind in _blocks(text):
+            blk = text[s0:e0]
+            net = re.search(r'\(net "([^"]*)"\)', blk)
+            net = net.group(1) if net else None
+            pts = [(float(x), float(y)) for x, y in
+                   re.findall(r'\((?:start|end|at) ([-\d.]+) ([-\d.]+)\)', blk)]
+            hit = False
+            for typ, desc, x, y in dang:
+                m = re.search(r'\[([^\]]*)\]', desc)
+                if not m or m.group(1) != net:
+                    continue
+                if (typ == 'via_dangling') != (kind == 'via'):
+                    continue
+                if any(abs(px - x) < 0.005 and abs(py - y) < 0.005 for px, py in pts):
+                    if kind != 'via':
+                        lm = re.search(r'length ([\d.]+) mm', desc)
+                        if lm and len(pts) >= 2:
+                            ln = ((pts[0][0] - pts[1][0]) ** 2 + (pts[0][1] - pts[1][1]) ** 2) ** 0.5
+                            if abs(ln - float(lm.group(1))) > 0.01:
+                                continue
+                    hit = True
+                    break
+            if hit:
+                out.append(text[last:s0])
+                last = e0
+                n += 1
+        out.append(text[last:])
+        if not n:
+            break
+        cand = os.path.join(work, f'sweep{rnd}.kicad_pcb')
+        open(cand, 'w').write(''.join(out))
+        _with_rules(cand)
+        unc2, err2 = drc(cand, pro_rules)
+        if unc2 <= unc and sum((err2 - err).values()) == 0:
+            shutil.copy(cand, cur)
+            removed += n
+            unc, err = unc2, err2
+        else:
+            break
+    return removed, unc, err, len(drc.last_dangling)
 
 
 def count_small(board, max_small_drill):
@@ -535,13 +593,17 @@ def main():
                 print("   retrying (routing is not fully deterministic)")
         if not accepted:
             print("   kept the original copper here")
+    gone, base_unc, base_err, dang_left = sweep_dangling(cur, pro_rules, work, base_unc, base_err)
+    if gone or dang_left:
+        print(f"Dangling sweep: removed {gone} dangling via/track stub(s); {dang_left} left")
     shutil.copy(cur, a.output)
     out_pro = os.path.splitext(a.output)[0] + '.kicad_pro'
     if os.path.abspath(out_pro) != os.path.abspath(pro_rules):
         shutil.copy(pro_rules, out_pro)
     print(f"\nDone: {base_small} small via(s) left; KiCad unconnected {base_unc}, "
           f"{sum(base_err.values())} error(s). Log: {log}")
-    print(f"SVE_RESULT start={start_small} end={base_small} unc_start={start_unc} unc_end={base_unc}")
+    print(f"SVE_RESULT start={start_small} end={base_small} unc_start={start_unc} unc_end={base_unc} "
+          f"swept={gone}")
     shutil.rmtree(work, ignore_errors=True)
 
 
