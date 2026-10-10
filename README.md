@@ -9,7 +9,7 @@ This is a fork of **[drandyhaas/KiCadRoutingTools](https://github.com/drandyhaas
 The fork is based on upstream **v0.22.1** (`023d3f79`). It adds 34 commits: speed-ups (a full route about 3x faster with identical output), bug fixes (shorts, clearance errors, mismatched diff-pair widths), and new post-route options (via-in-pad control, small-via replacement, power-neck widening, dangling-copper clean-up). They are listed and explained below. Upstream has since moved on (v0.23.0 and later); these changes have not yet been rebased onto it.
 
 - **Installing and using the tool:** see the original **[README-upstream.md](README-upstream.md)**. Installation is the same, but use this repository's URL. The Rust router must be rebuilt from this source (`python3 build_router.py`), because several changes are in Rust.
-- **The changes:** the rest of this page. It was written as a report for the upstream maintainer, so "you" means him and "I" means the author of these changes. Patch numbers 0001–0034 match, in order, the commits on `main` after `v0.22.1` (`git log --reverse v0.22.1..main`).
+- **The changes:** the rest of this page. It was written as a report for the upstream maintainer, so "you" means him and "I" means the author of these changes. Patch numbers 0001–0034 match, in order, the code commits on `main` after `v0.22.1` (`git log --reverse v0.22.1..main`; the README-only commits are not numbered).
 - **Licence:** MIT, as upstream (see [LICENSE](LICENSE)).
 
 ---
