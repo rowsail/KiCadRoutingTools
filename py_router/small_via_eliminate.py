@@ -320,6 +320,11 @@ def widen(cur, pro_rules, work, plan_args, base_unc, base_err):
         return bisect(pat, w, lo, mid, depth + 1, tag + 'a') + bisect(pat, w, mid, hi, depth + 1, tag + 'b')
 
     for k, (pat, w) in enumerate(zip(nets, widths)):
+        if _REPAIR_SCOPE is not None:
+            import fnmatch
+            if not any(fnmatch.fnmatchcase(pat, sc) or fnmatch.fnmatchcase(sc, pat)
+                       for sc in _REPAIR_SCOPE):
+                continue          # outside the repair scope: leave its widths alone
         n, got = attempt(pat, w, None, f'{k}')
         if got > 0:
             total += got
@@ -359,7 +364,11 @@ def route(inp, out, pro_rules, nets, full, plan_args, rip_existing=None, log=Non
     if os.path.exists(dru):
         shutil.copy(dru, os.path.splitext(inp)[0] + '.kicad_dru')
     cmd = [_python(), os.path.join(HERE, 'route.py'), inp, '--output', out,
-           '--nets', *nets, '--fab-tier', 'standard'] + plan_args + list(extra)
+           '--nets', *nets, '--fab-tier', 'standard',
+           # Board Setup's minimums are hard floors: a squeezed net may not
+           # neck below the board's own track / clearance (the user's site
+           # policy does the same inside KiCad; a CLI run never loads it).
+           '--escalation', 'board'] + plan_args + list(extra)
     if rip_existing:
         cmd += ['--rip-existing-nets', *rip_existing]
     env = dict(os.environ, PYTHONPATH=KICAD_PY)
@@ -374,6 +383,7 @@ def route(inp, out, pro_rules, nets, full, plan_args, rip_existing=None, log=Non
 
 _PRO_RULES = None     # the project the pass grades against (set in main)
 _PAD_KEEPOFF = None   # same-net pad keep-off (mm) when via-in-pad is off
+_REPAIR_SCOPE = None  # net globs the pass may change (None = all)
 
 
 def _with_rules(board_path):
@@ -513,6 +523,33 @@ def repair_groups(board_path, zone_nets):
                                'label': f"unconnected {m.group(1)}",
                                'pt': (it['pos']['x'], it['pos']['y'])})
     for x in j.get('violations', []):
+        if x['type'] != 'clearance':
+            continue
+        for it in x['items']:
+            if not it['description'].startswith(('Via', 'Track')):
+                continue
+            m = re.search(r'\[([^\]]*)\]', it['description'])
+            if m and m.group(1) not in zone_nets:
+                groups.append({'vias': [], 'rip': {m.group(1)}, 'repair': 'clearance',
+                               'label': f"clearance error on {m.group(1)}",
+                               'pt': (it['pos']['x'], it['pos']['y'])})
+                break
+    for x in j.get('unconnected_items', []):
+        # a plane net cut by signal tracks: re-route the signal nets with copper
+        # near the cut, kept off that net's plane layer(s)
+        its = [i for i in x['items'] if not i['description'].startswith('Zone')]
+        m = re.search(r'\[([^\]]*)\]', its[0]['description']) if its else None
+        if not m or m.group(1) not in zone_nets:
+            continue
+        near = set()
+        for i in its:
+            near |= set(signal_nets_near(board_path, i['pos']['x'], i['pos']['y'], 2.5, zone_nets))
+        if near:
+            groups.append({'vias': [], 'rip': near, 'repair': 'plane cut',
+                           'avoid_net_layers': m.group(1),
+                           'label': f"{m.group(1)} plane cut near ({its[0]['pos']['x']:.1f},{its[0]['pos']['y']:.1f})",
+                           'pt': (its[0]['pos']['x'], its[0]['pos']['y'])})
+    for x in j.get('violations', []):
         if x['type'] != 'starved_thermal':
             continue
         pad = next((i for i in x['items'] if i['description'].startswith('Pad')), None)
@@ -548,6 +585,48 @@ def signal_nets_near(board_path, x, y, radius_mm, zone_nets):
             if d < radius_mm:
                 out.add(net.group(1))
     return sorted(out)
+
+
+def avoid_plane_layers(plan_args, board_path, net):
+    """plan_args with every copper layer that carries a pour of `net`
+    forbidden (layer cost -1) -- route.py's --layer-costs is per layer in
+    board stack order."""
+    t = open(board_path).read()
+    layers = re.findall(r'\n\t\t\(\d+ "([^"]+\.Cu)" (?:signal|power|mixed|jumper)', t) or \
+        ['F.Cu', 'In1.Cu', 'In2.Cu', 'B.Cu']
+    # route.py orders --layer-costs by the STACK (F.Cu, In1..InN, B.Cu); KiCad 9+
+    # files list copper by layer id (F.Cu, B.Cu, In1, ...), so sort by stack.
+    def _stack(L):
+        if L == 'F.Cu':
+            return (0, 0)
+        if L == 'B.Cu':
+            return (2, 0)
+        m = re.match(r'In(\d+)\.Cu', L)
+        return (1, int(m.group(1)) if m else 0)
+    layers = sorted(set(layers), key=_stack)
+    plane = set()
+    for m in re.finditer(r'\n\t\(zone\b', t):
+        blk = t[m.start():m.start() + 600]
+        n = re.search(r'\((?:net_name|net) "([^"]+)"\)', blk)
+        if n and n.group(1) == net:
+            ls = re.search(r'\(layers? ([^)]*)\)', blk)
+            if ls:
+                plane |= set(re.findall(r'"([^"]+)"', ls.group(1)))
+    args = list(plan_args)
+    if '--layer-costs' in args:
+        i = args.index('--layer-costs') + 1
+        costs = []
+        while i + len(costs) < len(args) and not args[i + len(costs)].startswith('--'):
+            costs.append(args[i + len(costs)])
+    else:
+        args += ['--layer-costs']
+        i = len(args)
+        costs = ['1.0'] * len(layers)
+        args += costs
+    for k, L in enumerate(layers[:len(costs)]):
+        if L in plane and L not in ('F.Cu', 'B.Cu'):      # inner plane layers only
+            args[i + k] = '-1'
+    return args
 
 
 def pads_near(board_path, pts, radius_mm):
@@ -617,6 +696,10 @@ def main():
     ap.add_argument('input')
     ap.add_argument('output')
     ap.add_argument('--plan', help='plan JSON to take route parameters from')
+    ap.add_argument('--repair-scope', nargs='+', default=None, metavar='NET_GLOB',
+                    help='only rip / re-route nets matching these globs; any repair or '
+                         'replacement that would need other nets is skipped (e.g. after '
+                         'routing a few nets, leave hand-routed nets alone)')
     ap.add_argument('--pad-keepoff', type=float, default=None,
                     help='same-net pad keep-off in mm (via-in-pad off when > 0; -1 = allowed). '
                          'Default: the project\'s kicad_routing_tools.same_net_pad_clearance')
@@ -635,8 +718,9 @@ def main():
     open(log, 'w').close()
     cur = os.path.join(work, 'cur.kicad_pcb')
     shutil.copy(a.input, cur)
-    global _PRO_RULES, _PAD_KEEPOFF
+    global _PRO_RULES, _PAD_KEEPOFF, _REPAIR_SCOPE
     _PRO_RULES = pro_rules
+    _REPAIR_SCOPE = a.repair_scope
     if a.pad_keepoff is None:
         from pad_rules import project_pad_keepoff
         a.pad_keepoff = project_pad_keepoff(pro_rules)
@@ -679,11 +763,56 @@ def main():
     if base_viol:
         print(f"Via-in-pad keep-off violations: {base_viol}")
     if base_unc > 0:
+        probe = os.path.join(work, 'plain_weld.kicad_pcb')
+        shutil.copy(cur, probe)
+        frag, welded = weld(probe, full)
+        if welded:
+            u2, e2 = drc(probe, pro_rules)
+            if u2 < base_unc and sum((e2 - base_err).values()) == 0:
+                shutil.copy(probe, cur)
+                print(f"Plain weld: {welded} pour island(s) reconnected with full-size vias "
+                      f"(unconnected {base_unc} -> {u2})")
+                base_unc, base_err = u2, e2
+                drc(cur, pro_rules)
+                groups = [g for g in groups if g.get('repair') != 'unconnected'] + \
+                    [g for g in repair_groups(cur, zone_nets) if g.get('repair') in ('unconnected', 'plane cut')
+                     and not any(g2.get('label') == g.get('label') for g2 in groups)]
+    if base_unc > 0:
         sg = stranded_groups(cur, full, work)
         for g in sg:
             print(f"Boxed-in pad {g['pads'][0]} (pour island {g['island']:.2f} mm^2): "
                   f"escape needs {sorted(g['rip'])} moved")
         groups += sg
+    if a.repair_scope:
+        import fnmatch
+        def _in_scope(n):
+            return any(fnmatch.fnmatchcase(n, p) for p in a.repair_scope)
+        kept = []
+        for g in groups:
+            if g.get('repair') and not g['vias']:
+                inner = {n for n in g['rip'] if _in_scope(n)}
+                if inner:
+                    g['rip'] = inner
+                    kept.append(g)
+                continue
+            nets_needed = set(g['rip']) | {v['net'] for v in g['vias']}
+            if all(_in_scope(n) for n in nets_needed):
+                kept.append(g)
+        if len(kept) < len(groups):
+            print(f"Repair scope {a.repair_scope}: {len(groups) - len(kept)} group(s) left alone "
+                  f"(they would touch other nets)")
+        groups = kept
+    # One group per distinct job: several DRC items on the same net (e.g. one
+    # misplaced via clashing with four neighbours) are one re-route, not four.
+    _seen, _uniq = set(), []
+    for g in groups:
+        k = (g.get('repair'), frozenset(g['rip']),
+             frozenset((v['net'], round(v['x'], 2), round(v['y'], 2)) for v in g['vias']),
+             tuple(g.get('pads') or ()))
+        if k not in _seen:
+            _seen.add(k)
+            _uniq.append(g)
+    groups = _uniq
     for gi, g in enumerate(groups, 1):
         names = g.get('label') or ', '.join(f"{v['net']} @({v['x']:.2f},{v['y']:.2f})" for v in g['vias']) or \
             f"boxed-in pad {g['pads'][0]}"
@@ -722,8 +851,11 @@ def main():
             # gap (e.g. a GND pad between signal pins) gets its path before
             # the ripped signal nets are laid back around it.
             ok, hints = True, []
+            g_args = plan_args
+            if g.get('avoid_net_layers'):
+                g_args = avoid_plane_layers(plan_args, cur, g['avoid_net_layers'])
             if nets:
-                ok, hints = route(stripped, outp, pro_rules, nets, full, plan_args,
+                ok, hints = route(stripped, outp, pro_rules, nets, full, g_args,
                                   rip_existing=rip_existing, log=log, extra=extra)
             else:
                 shutil.copy(stripped, outp)

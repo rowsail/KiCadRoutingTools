@@ -6,10 +6,10 @@
 
 This is a fork of **[drandyhaas/KiCadRoutingTools](https://github.com/drandyhaas/KiCadRoutingTools)**, the Rust-accelerated A* autorouter for KiCad 9 and 10, by Dr. Andy Haas. All credit for the tool itself goes to him. If you find it useful, please consider [supporting the original project](https://ko-fi.com/drandyhaas).
 
-The fork is based on upstream **v0.22.1** (`023d3f79`). It adds 33 commits: speed-ups (a full route about 3x faster with identical output), bug fixes (shorts, clearance errors, mismatched diff-pair widths), and new post-route options (via-in-pad control, small-via replacement, power-neck widening, dangling-copper clean-up). They are listed and explained below. Upstream has since moved on (v0.23.0 and later); these changes have not yet been rebased onto it.
+The fork is based on upstream **v0.22.1** (`023d3f79`). It adds 34 commits: speed-ups (a full route about 3x faster with identical output), bug fixes (shorts, clearance errors, mismatched diff-pair widths), and new post-route options (via-in-pad control, small-via replacement, power-neck widening, dangling-copper clean-up). They are listed and explained below. Upstream has since moved on (v0.23.0 and later); these changes have not yet been rebased onto it.
 
 - **Installing and using the tool:** see the original **[README-upstream.md](README-upstream.md)**. Installation is the same, but use this repository's URL. The Rust router must be rebuilt from this source (`python3 build_router.py`), because several changes are in Rust.
-- **The changes:** the rest of this page. It was written as a report for the upstream maintainer, so "you" means him and "I" means the author of these changes. Patch numbers 0001–0033 match, in order, the commits on `main` after `v0.22.1` (`git log --reverse v0.22.1..main`).
+- **The changes:** the rest of this page. It was written as a report for the upstream maintainer, so "you" means him and "I" means the author of these changes. Patch numbers 0001–0034 match, in order, the commits on `main` after `v0.22.1` (`git log --reverse v0.22.1..main`).
 - **Licence:** MIT, as upstream (see [LICENSE](LICENSE)).
 
 ---
@@ -58,6 +58,7 @@ The changes fall into four kinds:
 | 0031 | small-via pass sweeps dangling copper reported by KiCad DRC | fix | on with 0028/0029 | yes: removes dangling vias/stubs |
 | 0032 | widen power-net necks after routing (DRC-checked, per net) | option | on with 0028/0029 | yes: wider power tracks |
 | 0033 | honour via-in-pad off everywhere (site policy in headless runs, return vias, welder, small-via pass); exposed centre pads exempt | fix | follows project | yes: no vias in normal pads |
+| 0034 | small-via pass: repair scope, plain weld, clearance and plane-cut repairs, Board Setup floors on its re-routes | option / fix | follows 0028/0029 | only where it repairs |
 
 Sections 0001–0011 below come from the first round and include the measurements. Later patches have their own sections further down.
 
@@ -389,5 +390,31 @@ Measured: 210 of 230 necks widened, with DRC unchanged.
 
 Measured: keep-off violations went from 17 to 1, and 42 thermal vias were
 restored to exposed pads.
+
+## 0034 — Small-via pass: repair scope, plain weld, clearance and plane-cut repairs
+
+These came out of re-routing a handful of nets after a schematic fix, on a board
+that has hand routing elsewhere:
+
+- `--repair-scope NET_GLOB...` limits what the pass may rip and re-route. A repair
+  that would need other nets is narrowed to the in-scope ones, or skipped. Power-neck
+  widening also stays inside the scope, so hand-routed nets are left alone.
+- **Plain weld first:** cut-off pour islands are reconnected with vias alone, with
+  no ripping, before any repair group runs.
+- **New repair kinds:**
+  - clearance errors on a signal net's track or via: that net is re-routed;
+  - plane cuts (a plane net split by signal tracks): the in-scope signal nets near
+    the cut are re-routed with that net's inner plane layer forbidden.
+- **Duplicate groups merged:** several DRC items from the same cause are now one
+  re-route.
+- **Board Setup floors on re-routes:** the pass's own `route.py` calls use
+  `--escalation board`, so a squeezed net never necks below Board Setup's track or
+  clearance minimums. A CLI run never loads a KiCad site policy that would otherwise
+  enforce this.
+
+Finding: when Board Setup's minimum clearance is below a net class's clearance,
+`--escalation board` still lets the router go down to the Board Setup value, while
+KiCad's DRC enforces the class value. Keep the two equal, or the router can make
+DRC errors.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
