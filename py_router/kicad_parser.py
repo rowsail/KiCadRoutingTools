@@ -6258,6 +6258,9 @@ def _extract_board_contours_from_pcbnew(board, to_mm, include_footprints=True,
     if edge_cuts_id is None:
         return [], []
 
+    # (ring vertices, ring segments) for every gr_poly ring seen; see below.
+    poly_rings = []
+
     def _shape_segments(drawing):
         """Segments for one Edge.Cuts PCB_SHAPE (line/rect/arc/circle/bezier)."""
         segs = []
@@ -6318,10 +6321,14 @@ def _extract_board_contours_from_pcbnew(board, to_mm, include_footprints=True,
                 ring = poly.Outline(oi)
                 pts = [(to_mm(ring.CPoint(i).x), to_mm(ring.CPoint(i).y))
                        for i in range(ring.PointCount())]
+                ring_segs = []
                 for i in range(len(pts)):
                     a, b = pts[i], pts[(i + 1) % len(pts)]  # close the ring
                     if abs(b[0] - a[0]) >= 0.001 or abs(b[1] - a[1]) >= 0.001:
-                        segs.append((a, b))
+                        ring_segs.append((a, b))
+                segs.extend(ring_segs)
+                if len(ring_segs) >= 3:
+                    poly_rings.append(([s[0] for s in ring_segs], ring_segs))
         return segs
 
     segments = []
@@ -6400,7 +6407,18 @@ def _extract_board_contours_from_pcbnew(board, to_mm, include_footprints=True,
             if all_axis_aligned:
                 return [], []
 
-    contours = _chain_segments_into_contours(segments)
+    # A gr_poly ring is already closed and ordered: take it whole, as the text
+    # parser does (extract_board_contours). Re-chaining at 0.01 mm merges the
+    # vertices of a finely sampled DXF arc and the ring never closes (PSR3).
+    # Only rings whose segments all made it into `segments` count (an
+    # owners-only footprint shape is not part of the contour set).
+    seg_set = set(segments)
+    rings = [(r, rs) for r, rs in poly_rings if all(s in seg_set for s in rs)]
+    ring_segs = {s for _r, rs in rings for s in rs}
+    contours = [list(r) for r, _rs in rings]
+    other = [s for s in segments if s not in ring_segs]
+    if other:
+        contours += _chain_segments_into_contours(other)
     if not contours:
         return [], []
 

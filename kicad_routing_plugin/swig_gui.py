@@ -241,6 +241,11 @@ def _get_board_minimum_constraints():
         if hasattr(ds, 'm_CopperEdgeClearance'):
             result['min_copper_edge_clearance'] = _nm_to_mm(ds.m_CopperEdgeClearance)
 
+        # Minimum via annular ring: with the minimum hole it sets the smallest
+        # legal via, whatever the minimum via diameter says.
+        if hasattr(ds, 'm_ViasMinAnnularWidth'):
+            result['min_via_annular_width'] = _nm_to_mm(ds.m_ViasMinAnnularWidth)
+
         return result
     except Exception:
         return None
@@ -795,6 +800,7 @@ class RoutingDialog(wx.Dialog):
                          ('min_via_size', 'via_diameter'),
                          ('min_via_drill', 'via_drill'),
                          ('min_hole_to_hole', 'hole_to_hole'),
+                         ('min_via_annular_width', 'annular'),
                          ('min_copper_edge_clearance', 'board_edge')):
             v = mins.get(src)
             if isinstance(v, (int, float)) and v > 1e-9:
