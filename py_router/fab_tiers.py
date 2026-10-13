@@ -331,6 +331,14 @@ def _apply_board_via_capability(rungs, copper_layer_count):
     phys = _layer_floors(copper_layer_count)['advanced']
     cap = {k: max(float(bf[k]), phys[k]) for k in ('via_diameter', 'via_drill')
            if bf.get(k) is not None}
+    # The minimum via diameter alone is not the smallest legal via: it must
+    # also hold the minimum hole plus the minimum annular ring on both sides.
+    # Measured on PSR3 (min via 0.381, min hole 0.381, annular 0.1524): the
+    # floor came out 0.381/0.381, a zero-ring via that fails DRC annular and
+    # hole clearance at every use.
+    if 'via_drill' in cap and bf.get('annular'):
+        cap['via_diameter'] = round(max(cap.get('via_diameter', 0.0),
+                                        cap['via_drill'] + 2.0 * float(bf['annular'])), 4)
     # Board Setup's via minimum is the via floor at every rung, in BOTH
     # directions (local change): a smaller declared via lowers the rungs (the
     # fab can drill it), a larger one raises them (the designer does not want

@@ -2931,7 +2931,18 @@ def extract_board_contours(content: str) -> Tuple[List[List[Tuple[float, float]]
             if all_axis_aligned:
                 return [], []  # Simple rectangle, use bounding box
 
-    contours = _chain_segments_into_contours(segments)
+    # A gr_poly is already a closed, ordered ring: take it whole instead of
+    # re-chaining its edges. Chaining joins endpoints within 0.01 mm, and a
+    # DXF-imported outline samples its arcs far finer than that (PSR3: 504 of
+    # 596 edges shorter than 0.01 mm), so neighbouring vertices merged, the
+    # ring never closed and the router fell back to the bounding box --
+    # tracks were routed straight across the outline's notches.
+    poly_rings = [p for p in _parse_gr_polys_on_layer(content, "Edge.Cuts") if len(p) >= 3]
+    poly_segs = {(p[i], p[(i + 1) % len(p)]) for p in poly_rings for i in range(len(p))}
+    other = [s for s in segments if s not in poly_segs]
+    contours = [list(p) for p in poly_rings]
+    if other:
+        contours += _chain_segments_into_contours(other)
     if not contours:
         return [], []
 
