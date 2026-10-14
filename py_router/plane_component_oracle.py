@@ -114,10 +114,15 @@ class PlaneComponentOracle:
         for pad_idx in sorted(pad_repr):
             pad_count[uf.find(pad_repr[pad_idx])] += 1
 
-        # Main root: among zone-credited components, the one with most pads
-        # (a floating zone fragment loses to the real plane); if no zone has
-        # any credited point, fall back to the most-pad component. Ties break
-        # by first occurrence in zone/pad order -- deterministic.
+        # Main root: among zone-credited components, the one holding the most
+        # zone AREA, then the most pads (a floating zone fragment loses to the
+        # real plane); if no zone has any credited point, fall back to the
+        # most-pad component. Ties break by first occurrence in zone/pad
+        # order -- deterministic. Area comes first because before routing a
+        # big plane may credit one through-hole pad while a ~1 mm^2 pad-patch
+        # zone of the same net credits two: ranked by pads alone the patch
+        # won, every new tap via was confined to its outline, and all the
+        # plane's other pads failed with no candidate site (PSR3 VCC).
         zone_roots: List[int] = []
         for zone_idx in sorted(zone_repr):
             r = uf.find(zone_repr[zone_idx])
@@ -136,7 +141,15 @@ class PlaneComponentOracle:
             # main; taps must place fresh vias (zone outlines stay unfiltered
             # via main_zone_polygons() returning empty -> caller falls back).
             return
-        main_root = max(candidates, key=lambda r: pad_count.get(r, 0))
+        zone_area: Dict[int, float] = defaultdict(float)
+        for zone_idx in sorted(zone_repr):
+            poly = getattr(zones[zone_idx], 'polygon', None) or []
+            if len(poly) >= 3:
+                zone_area[uf.find(zone_repr[zone_idx])] += abs(sum(
+                    poly[i][0] * poly[i - 1][1] - poly[i - 1][0] * poly[i][1]
+                    for i in range(len(poly)))) / 2.0
+        main_root = max(candidates, key=lambda r: (zone_area.get(r, 0.0),
+                                                   pad_count.get(r, 0)))
 
         for via_idx in sorted(via_repr):
             if uf.find(via_repr[via_idx]) == main_root:
