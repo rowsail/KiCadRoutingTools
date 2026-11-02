@@ -281,6 +281,12 @@ def _empty_results_data() -> dict:
 # merged tally instead of whichever emission a reader happened to scrape.
 _SUMMARY_SINK: List[dict] = []
 _RECONCILE_RAISED = [False]
+# Clearance tiers (see batch_route): the merged tally of each earlier tier,
+# folded into the final tier's MIN line and --json-out file.
+_TIER_SUMMARIES: List[dict] = []
+# Set while a tier pass runs: it prints its own tally under a different tag so
+# the outermost call still prints exactly one JSON_SUMMARY_MIN.
+_TIER_PASS: List[str] = []
 
 # #562 finalize re-entry guard. batch_route's plane finalize calls
 # repair_planes, whose own rip-casualty / pad-repair sub-runs call batch_route
@@ -300,6 +306,30 @@ def _plane_finalize_active() -> bool:
     return _PLANE_FINALIZE_DEPTH > 0
 
 
+def _finalize_never_rip(pcb_data, net_names, net_name_patterns,
+                        keep_input_copper, scope_ids) -> List[str]:
+    """Names of the nets the in-run plane finalize may not rip as blockers:
+    every net '!'-negated in the caller's --nets patterns, plus, under
+    --keep-input-copper, every net with copper that is outside this run's
+    routing scope (``scope_ids``: the routed nets and the explicit
+    --rip-existing-nets candidates)."""
+    from net_queries import split_net_patterns, net_pattern_matches
+    pats = list(net_name_patterns if net_name_patterns is not None
+                else (net_names or []))
+    names = {n.name for n in pcb_data.nets.values() if n.name}
+    out = set()
+    if pats:
+        _, neg = split_net_patterns(pats, names)
+        if neg:
+            out |= {n for n in names if any(net_pattern_matches(n, p) for p in neg)}
+    if keep_input_copper:
+        with_copper = ({s.net_id for s in pcb_data.segments}
+                       | {v.net_id for v in pcb_data.vias})
+        out |= {pcb_data.nets[i].name for i in with_copper
+                if i not in scope_ids and i in pcb_data.nets and pcb_data.nets[i].name}
+    return sorted(out)
+
+
 def _emit_summary_min(gate_report: Optional[dict] = None,
                       status: Optional[str] = None) -> None:
     """Print the ONE compact verdict line for an outermost run.
@@ -316,8 +346,15 @@ def _emit_summary_min(gate_report: Optional[dict] = None,
     ordinary run.
     """
     try:
-        from route_summary import merge_summaries as _ms, summary_min
+        from route_summary import (merge_summaries as _ms, summary_min,
+                                   fold_tier_summaries, fold_gate_losses)
         _m = _ms(list(_SUMMARY_SINK), _RECONCILE_RAISED[0])
+        _m = (fold_tier_summaries(_m, _TIER_SUMMARIES)
+              if _TIER_SUMMARIES and not _TIER_PASS else _m)
+        # A rejected run was reverted to its input: what the gate saw it break
+        # is not on the board.
+        if gate_report and gate_report.get('verdict') != 'reject':
+            _m = fold_gate_losses(_m, gate_report.get('lost'))
         if _m is None and status is not None:
             # The early returns fire before any summary is built, so there is
             # nothing in the sink to merge: synthesize the empty tally rather
@@ -339,7 +376,9 @@ def _emit_summary_min(gate_report: Optional[dict] = None,
             pass
         if gate_report and gate_report.get('verdict') == 'reject':
             _min['improvement_gate'] = 'reverted'
-        print("JSON_SUMMARY_MIN: " + json.dumps(_min, sort_keys=True))
+        _tag = (f"JSON_TIER_SUMMARY_MIN ({_TIER_PASS[-1]})" if _TIER_PASS
+                else "JSON_SUMMARY_MIN")
+        print(f"{_tag}: " + json.dumps(_min, sort_keys=True))
     except Exception as _e:                                     # noqa: BLE001
         print(f"  WARNING: could not emit JSON_SUMMARY_MIN: {_e}")
 
@@ -466,6 +505,139 @@ def _late_orphan_sweep659(pcb_data, output_file, return_results, results_data,
                   f"({_s} segment(s), {_nv} via(s))")
     except Exception as _e:
         print(f"  (late orphan sweep skipped: {_e})")
+
+
+
+def _clearance_tier_plan(args: dict):
+    """The clearance tiers a batch_route call must run in, or None.
+
+    The routing-side clearance floor is ONE value for a whole call: the
+    largest class among the routed nets (routing_config.set_net_clearances),
+    so every routed net clears every obstacle at that class. On a board that
+    mixes classes -- a 2 mm HV class beside 0.2 mm signals -- one HV net in the
+    call prices every pad on the board at 2 mm for EVERY net, and fine-pitch
+    pads cannot be left at all ("8/8 neighbors blocked" from the first net on;
+    measured on a 4-layer HV supply: 0 of 106 nets after 15 minutes). The
+    floor cannot simply drop to the smallest class: the via paths (in-pad
+    unblock, in-progress rings, allowed rects) all rely on the shared map
+    carrying the routed net's clearance.
+
+    So a mixed call is split into one call per class, highest first, each with
+    a uniform floor, and each later tier sees the earlier copper as fixed
+    obstacles at its own class (KiCad's pairwise max). Only file-to-file
+    OUTERMOST calls tier (no live pcb_data, no return_results, not a
+    sub-run); KICAD_CLEARANCE_TIERS=0 restores the single call.
+    Returns [(clearance_mm, [net names]), ...] highest first, the LAST entry
+    being the remainder the original call routes."""
+    if not env_knobs.CLEARANCE_TIERS or _TIER_PASS:
+        return None
+    if (not args.get('final_reconcile') or args.get('pcb_data') is not None
+            or args.get('return_results') or args.get('skip_routing')):
+        return None
+    inp, names = args.get('input_file'), list(args.get('net_names') or [])
+    if not (inp and os.path.isfile(inp) and args.get('output_file') and len(names) > 1):
+        return None
+    try:
+        nc = args.get('net_clearances')
+        if nc:                                   # id-keyed, resolved by the CLI
+            pcb = parse_kicad_pcb(inp)
+            by_name = {pcb.nets[i].name: c for i, c in nc.items() if i in pcb.nets}
+        elif nc is None:
+            from list_nets import net_clearance_map
+            by_name = net_clearance_map(inp, names) or {}
+        else:
+            by_name = {}
+    except Exception as _e:                                    # noqa: BLE001
+        print(f"  (clearance tiers skipped: {_e})")
+        return None
+    base = float(args.get('clearance') or defaults.CLEARANCE)
+    ceil_ = args.get('clearance_ceiling')
+
+    def _cls(n):
+        c = by_name.get(n)
+        c = base if c is None else max(base, float(c))
+        return min(c, ceil_) if ceil_ is not None else c
+    groups: Dict[float, List[str]] = {}
+    for n in names:
+        groups.setdefault(round(_cls(n), 4), []).append(n)
+    if len(groups) < 2:
+        return None
+    return [(c, groups[c]) for c in sorted(groups, reverse=True)]
+
+
+def _route_clearance_tiers(plan, a: dict):
+    """Run a batch_route call as clearance tiers (see _clearance_tier_plan).
+
+    The tier passes are complete runs of their own (reconciliation and plane
+    finalize included) whose tallies fold into the one JSON_SUMMARY_MIN /
+    --json-out of the call; each later tier names the earlier tiers' nets as
+    '!'-negated in its patterns, so nothing in it may rip them. The last tier
+    holds one class, so its batch_route call does not tier again."""
+    print("\nClearance tiers: this call mixes net classes, so it routes one class at a "
+          "time, highest first, each against the copper of the classes before it:")
+    for c, ns in plan:
+        print(f"  {c:g} mm: {len(ns)} net(s)"
+              f" ({', '.join(ns[:6])}{', ...' if len(ns) > 6 else ''})")
+    a = {k: v for k, v in a.items() if k != '_tier_plan'}
+    input_file, output_file = a['input_file'], a['output_file']
+    from copy_board import SIBLING_EXTS
+    stem = os.path.splitext(output_file)[0]
+    cur, made, done = input_file, [], []
+    _TIER_SUMMARIES.clear()
+    tot_ok = tot_fail = 0
+    tot_t = 0.0
+    try:
+        for i, (c, ns) in enumerate(plan[:-1], 1):
+            tmp = f"{stem}.tier{i}.kicad_pcb"
+            made.append(tmp)
+            label = f"tier {i}/{len(plan)}: {c:g} mm"
+            print(f"\n{'=' * 60}\nClearance {label} -- {len(ns)} net(s)\n{'=' * 60}")
+            ta = dict(a, input_file=cur, output_file=tmp, net_names=list(ns),
+                      json_out=None,
+                      net_name_patterns=list(a.get('net_name_patterns') or [])
+                      + [f"!{n}" for n in done])
+            _TIER_PASS.append(label)
+            try:
+                r = batch_route(**ta)
+            finally:
+                _TIER_PASS.pop()
+            from route_summary import merge_summaries
+            m = merge_summaries(list(_SUMMARY_SINK), _RECONCILE_RAISED[0]) or {
+                'successful': 0, 'failed': 0}
+            m['tier_clearance'] = c
+            m['tier_nets'] = list(ns)
+            _TIER_SUMMARIES.append(m)
+            print("JSON_TIER_SUMMARY: " + json.dumps(m, default=str))
+            tot_ok += r[0]; tot_fail += r[1]; tot_t += r[2]
+            if not os.path.isfile(tmp):
+                from copy_board import copy_board as _cb
+                _cb(cur, tmp)
+            # The next tier reads its rules from the board's siblings: carry
+            # any the writer did not produce (the .kicad_dru in particular).
+            import shutil
+            for ext in SIBLING_EXTS:
+                _src = os.path.splitext(cur)[0] + ext
+                _dst = os.path.splitext(tmp)[0] + ext
+                if os.path.isfile(_src) and not os.path.isfile(_dst):
+                    shutil.copyfile(_src, _dst)
+            cur = tmp
+            done += list(ns)
+        c, ns = plan[-1]
+        print(f"\n{'=' * 60}\nClearance tier {len(plan)}/{len(plan)}: {c:g} mm -- "
+              f"{len(ns)} net(s)\n{'=' * 60}")
+        fa = dict(a, input_file=cur, net_names=list(ns),
+                  net_name_patterns=list(a.get('net_name_patterns') or [])
+                  + [f"!{n}" for n in done])
+        r = batch_route(**fa)
+        return (r[0] + tot_ok, r[1] + tot_fail, r[2] + tot_t) + tuple(r[3:])
+    finally:
+        _TIER_SUMMARIES.clear()
+        for tmp in made:
+            for ext in ('.kicad_pcb',) + tuple(SIBLING_EXTS):
+                try:
+                    os.remove(os.path.splitext(tmp)[0] + ext)
+                except OSError:
+                    pass
 
 
 
@@ -684,6 +856,13 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         If return_results=False: (successful_count, failed_count, total_time)
         If return_results=True: (successful_count, failed_count, total_time, results_data)
     """
+    # A call mixing net-class clearances routes as one pass per class,
+    # highest first (_clearance_tier_plan says why); locals() here is exactly
+    # the parameter set, and the name is deleted again before the snapshot.
+    _tier_plan = _clearance_tier_plan(dict(locals()))
+    if _tier_plan:
+        return _route_clearance_tiers(_tier_plan, dict(locals(), _tier_plan=None))
+    del _tier_plan
     # Snapshot of THIS call's parameters, taken before any body code runs:
     # the end-of-run reconciliation self-invocation forwards every parameter
     # verbatim (only overriding the self-referential ones) so a rescue pass
@@ -1932,9 +2111,21 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     # unrecoverable victims were term3_ecp5's +1V1//PF37+//PE26+ opens.
     # The sub-run falls back to hinted #103 authority only (explicitly
     # ripped nets join its routing scope as first-class targets).
-    if (rip_preexisting
-            if rip_preexisting is not None
-            else os.environ.get('KICAD_RIP_PREEXISTING', '1') != '0'):
+    # --keep-input-copper makes input copper READ-ONLY, so it switches the
+    # candidacy off as well: before this the flag only shielded input copper
+    # from the cleanup sweeps, and a chained step that passed it still ripped
+    # earlier steps' nets as auto-candidates -- measured on a 4-layer HV
+    # board, 52-55 pre-existing rips per step and a previously-connected net
+    # broken by each of three steps. Explicit --rip-existing-nets is the
+    # operator naming nets, and still applies.
+    _pe_on = (rip_preexisting if rip_preexisting is not None
+              else os.environ.get('KICAD_RIP_PREEXISTING', '1') != '0')
+    if _pe_on and keep_input_copper:
+        print("--keep-input-copper: pre-existing nets are not auto-registered "
+              "as rip candidates (input copper is read-only; name nets in "
+              "--rip-existing-nets to rip them)")
+        _pe_on = False
+    if _pe_on:
         from net_queries import split_net_patterns, net_pattern_matches
         _pe_to_route = set(all_net_ids_to_route)
         _pe_zone_nids = {z.net_id for z in pcb_data.zones}
@@ -4290,7 +4481,12 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         summary['env_knobs'] = _ek653.active_env_knobs()   # dirty baseline
     except Exception:          # without re-reading logs
         pass
-    print(f"JSON_SUMMARY: {json.dumps(summary)}")
+    # Inside a clearance-tier pass the big line carries its own tag: a log
+    # reader (route_summary.merge_route_summaries) folds each tier from the
+    # one JSON_TIER_SUMMARY line the tier wrapper prints, and a pass-level
+    # line under the plain tag would join the last-wins merge instead.
+    print(f"{'JSON_TIER_PASS_SUMMARY' if _TIER_PASS else 'JSON_SUMMARY'}: "
+          f"{json.dumps(summary)}")
     _SUMMARY_SINK.append(summary)
 
     # Write output file or return results for direct application
@@ -4806,6 +5002,16 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                     _zpairs = [(n, _l) for n, _l in _zpairs
                                if n in set(_broken9)]
             _finalize_rip9 = os.environ.get('KICAD_FINALIZE_RIP', '1') == '1'
+            # The finalize's blocker rips must respect the caller's scope:
+            # a net '!'-negated in --nets is hands-off BY PLAN (the same guard
+            # the #103 hints and the pre-existing candidacy apply), and
+            # --keep-input-copper makes every net this run does not route
+            # read-only. Measured on a 4-layer HV board: the GND pad repair
+            # ripped an explicitly negated '/EFUSE/SHDN' to land a tap via and
+            # the net shipped open.
+            _never_rip9 = _finalize_never_rip(
+                pcb_data, net_names, net_name_patterns, keep_input_copper,
+                set(all_net_ids_to_route) | set(existing_rippable))
             if _zpairs:
                 _zn = [n for n, _l in _zpairs]
                 _zl = [_l for _n, _l in _zpairs]
@@ -4893,6 +5099,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                         # custody-restores casualties; KICAD_FINALIZE_RIP=0
                         # reverts for A/B.
                         rip_blocker_nets=_finalize_rip9,
+                        never_rip_nets=_never_rip9,
                         power_nets=power_nets,
                         power_nets_widths=power_nets_widths,
                         # #658: the chain's layer economics reach the
@@ -4972,6 +5179,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                             if config.same_net_pad_clearance > 0 else None),
                         # Same rip-authority restoration as the GUI leg above.
                         rip_blocker_nets=_finalize_rip9,
+                        never_rip_nets=_never_rip9,
                         power_nets=power_nets,
                         power_nets_widths=power_nets_widths,
                         # #658: same layer economics as the GUI leg above.
@@ -6092,6 +6300,9 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         try:
             from route_summary import merge_summaries, write_summary_file
             _merged = merge_summaries(list(_SUMMARY_SINK), _RECONCILE_RAISED[0])
+            if _TIER_SUMMARIES:
+                from route_summary import fold_tier_summaries
+                _merged = fold_tier_summaries(_merged, _TIER_SUMMARIES)
             # ALL-OR-NOTHING (#830). This was `open(json_out,'w')` +
             # `json.dump`, which truncates the destination before the first
             # chunk is encoded and then STREAMS into it -- so a failure partway
@@ -6305,6 +6516,24 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
             print(f"JSON_IMPROVEMENT_GATE: {json.dumps(_gate_report)}")
             if return_results:
                 results_data['improvement_gate'] = _gate_report
+            # The --json-out file was written before the gate measured the
+            # board: a net the run broke outside every pass's scope reaches it
+            # only through this rewrite (the MIN line folds it the same way).
+            if json_out and _cmp.get('lost') and _verdict != 'reject':
+                try:
+                    from route_summary import (merge_summaries as _ms9,
+                                               fold_tier_summaries as _ft9,
+                                               fold_gate_losses as _fg9,
+                                               write_summary_file as _ws9)
+                    _mg9 = _ms9(list(_SUMMARY_SINK), _RECONCILE_RAISED[0])
+                    if _TIER_SUMMARIES:
+                        _mg9 = _ft9(_mg9, _TIER_SUMMARIES)
+                    _mg9 = _fg9(_mg9, _cmp['lost'])
+                    if _mg9 is not None:
+                        _ws9(json_out, _mg9)
+                except Exception as _je9:                  # noqa: BLE001
+                    print(f"  WARNING: could not fold the gate's lost nets "
+                          f"into {json_out}: {_je9}")
         except Exception as _ge:
             # A gate that crashes must not take the run's board with it.
             print(f"  (improvement gate skipped: {_ge})")
@@ -6668,8 +6897,12 @@ For differential pair routing, use route_diff.py:
                              "run's new copper. For chained flows whose earlier stages author "
                              "copper (fanout escape stubs, hand-routed nets) that later stages "
                              "or checks must still see verbatim - including stubs of nets this "
-                             "run FAILED to route. Default: off (issue #84 semantics: dead "
-                             "input stubs on in-scope nets are swept).")
+                             "run FAILED to route. It also keeps the input's nets out of "
+                             "automatic rip-up: no pre-existing net is auto-registered as a "
+                             "rip candidate, and the in-run plane finalize rips no net outside "
+                             "this run's scope (name nets in --rip-existing-nets to allow it). "
+                             "Default: off (issue #84 semantics: dead input stubs on in-scope "
+                             "nets are swept).")
 
     # Length matching options
     parser.add_argument("--length-match-group", action="append", nargs="+", dest="length_match_groups",

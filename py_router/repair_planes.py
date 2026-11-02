@@ -768,6 +768,10 @@ def repair_planes(
     # clearance. None (default) auto-reads the persisted .kicad_pro record;
     # explicit values win (the #562 finalize forwards its resolved value).
     same_net_pad_clearance: Optional[float] = None,
+    # Nets the CALLER put out of bounds (route.py's finalize: '!'-negated in
+    # its --nets, and under --keep-input-copper every net outside its scope).
+    # They join the never-rip set exactly like #521-protected nets.
+    never_rip_nets: Optional[List[str]] = None,
 ) -> Tuple[int, int]:
     """
     Route between disconnected regions in power plane zones.
@@ -1171,6 +1175,16 @@ def repair_planes(
             plane_net_ids |= _prot_ids
     except Exception:
         pass
+    if never_rip_nets:
+        _nr_names = set(never_rip_nets)
+        _nr_ids = {nid for nid, n in pcb_data.nets.items()
+                   if n.name in _nr_names} - plane_net_ids
+        if _nr_ids and rip_blocker_nets:
+            _ex = sorted(pcb_data.nets[i].name for i in _nr_ids)[:4]
+            print(f"  {len(_nr_ids)} out-of-scope net(s) excluded from blocker "
+                  f"rip-up by the caller ({', '.join(_ex)}"
+                  f"{'...' if len(_nr_ids) > 4 else ''})")
+        plane_net_ids |= _nr_ids
     ripped_net_ids: List[int] = []
     # #517 arm 3 (#524 root cause): nets whose immediate reconnect SUCCEEDED
     # leave ripped_net_ids (they are no longer casualties) -- but their

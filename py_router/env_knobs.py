@@ -69,6 +69,10 @@ def refresh() -> None:
     g['BUS_MULTIPOINT_SPAN'] = _on_default('KICAD_BUS_MULTIPOINT_SPAN')
     g['BARE_BALL_ZONE_EXEMPT'] = _on_default('KICAD_BARE_BALL_ZONE_EXEMPT')
     g['DIRECT_FIRST'] = _on_default('KICAD_DIRECT_FIRST')
+    # Clearance tiers (route.batch_route): a call mixing net classes routes
+    # one class at a time, highest first. =0 restores the single call, whose
+    # floor is the LARGEST routed class for every net.
+    g['CLEARANCE_TIERS'] = _on_default('KICAD_CLEARANCE_TIERS')
     # In-loop stub-debris trim (default ON, KICAD_STUB_DEBRIS_TRIM=0
     # reverts): when a route commits, immediately prune the unused
     # branches of its own pre-existing stub tree AND any via they leave
