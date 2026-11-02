@@ -23,8 +23,9 @@ import re
 from typing import Dict, List, Optional
 
 __all__ = ['merge_summaries', 'merge_route_summaries', 'summary_min',
+           'fold_gate_losses', 'fold_tier_summaries',
            'write_summary_file', 'SUMMARY_RE', 'SUMMARY_MIN_RE',
-           'RECONCILE_ABORTED', 'EFFORT_KEYS']
+           'RECONCILE_ABORTED', 'EFFORT_KEYS', 'TIER_SUMMARY_RE']
 
 SUMMARY_RE = re.compile(r'JSON_SUMMARY: (\{.*\})')
 
@@ -34,6 +35,11 @@ SUMMARY_RE = re.compile(r'JSON_SUMMARY: (\{.*\})')
 # about. The trailing colon-space differs from SUMMARY_RE's subject, so
 # neither regex can eat the other.
 SUMMARY_MIN_RE = re.compile(r'JSON_SUMMARY_MIN: (\{.*\})')
+
+# One merged tally per earlier clearance tier (route.batch_route), printed by
+# the tier wrapper; the passes inside a tier print JSON_TIER_PASS_SUMMARY,
+# which neither regex matches.
+TIER_SUMMARY_RE = re.compile(r'JSON_TIER_SUMMARY: (\{.*\})')
 
 # route.py prints this from the except around its reconciliation self-invoke.
 # The sub-run prints its JSON_SUMMARY BEFORE the board is written, so a summary
@@ -233,6 +239,80 @@ def merge_summaries(summaries: List[Dict], aborted: bool = False) -> Optional[Di
     return merged
 
 
+def _classified(merged: Dict) -> set:
+    names = set(merged.get('routed_single') or [])
+    names |= set(merged.get('failed_single') or [])
+    names |= set(merged.get('open_single') or [])
+    names |= {d.get('net_name') if isinstance(d, dict) else d
+              for d in (merged.get('failed_multipoint') or [])}
+    names |= set(merged.get('coverage_gate_nets') or [])
+    return names
+
+
+def fold_gate_losses(merged: Optional[Dict], lost) -> Optional[Dict]:
+    """Fold the improvement gate's LOST nets (previously connected on the
+    input, disconnected on the output) into a merged tally.
+
+    The gate measures the whole board, but every failure key in a summary is
+    scoped to the nets some pass routed. A net broken by a step that never
+    routes it -- the in-run plane finalize ripping a blocker for a tap via --
+    is therefore named by the gate and by nothing else, and the merged tally
+    read `failed: 0` over a board shipping it open. Each such net is added to
+    ``coverage_gate_nets`` (the existing disturbed-but-unowned channel, which
+    weighs 1 in the pad deficit) unless a summary already classifies it, and
+    ``broken_by_run`` names every lost net. Returns a new dict; None in, None
+    out."""
+    if merged is None:
+        return None
+    lost = [n for n in (lost or []) if n]
+    if not lost:
+        return merged
+    out = dict(merged)
+    known = _classified(out)
+    extra = [n for n in lost if n not in known]
+    if extra:
+        out['coverage_gate_nets'] = list(out.get('coverage_gate_nets') or []) + extra
+        out['multipoint_pads_total'] = (out.get('multipoint_pads_total') or 0) + len(extra)
+    out['broken_by_run'] = sorted(set(lost))
+    return out
+
+
+def fold_tier_summaries(merged: Optional[Dict], tiers: List[Dict]) -> Optional[Dict]:
+    """Fold the merged tallies of earlier CLEARANCE TIERS into the final
+    tier's merged tally (route.py runs a call that mixes net classes as one
+    pass per class, highest first; see batch_route). The tiers route disjoint
+    nets, so failure lists concatenate and counts add; effort adds as it does
+    across passes. Each tier dict is itself the merge of that tier's passes."""
+    if not tiers:
+        return merged
+    out = dict(merged or {'successful': 0, 'failed': 0})
+    for t in tiers:
+        for k in ('failed_single', 'open_single', 'failed_multipoint',
+                  'routed_single', 'pad_pairs_open', 'coverage_gate_nets',
+                  'blockers', 'boxed_in', 'broken_by_run'):
+            if t.get(k):
+                out[k] = list(t[k]) + list(out.get(k) or [])
+        for k in ('successful', 'failed', 'multipoint_pads_connected',
+                  'multipoint_pads_total', 'pad_pairs_connected',
+                  'pad_pairs_total') + EFFORT_KEYS:
+            if k in t or k in out:
+                out[k] = (t.get(k) or 0) + (out.get(k) or 0)
+        if isinstance(t.get('terminal_restores'), dict):
+            tr = dict(t['terminal_restores']); tr.update(out.get('terminal_restores') or {})
+            out['terminal_restores'] = tr
+        _m = [v for v in (t.get('min_clearance_used'), out.get('min_clearance_used'))
+              if isinstance(v, (int, float))]
+        if _m:
+            out['min_clearance_used'] = min(_m)
+        if t.get('complete') is False:
+            out['complete'] = False
+    out['clearance_tiers'] = [{'clearance': t.get('tier_clearance'),
+                               'nets': t.get('tier_nets'),
+                               'successful': t.get('successful'),
+                               'failed': t.get('failed')} for t in tiers]
+    return out
+
+
 def merge_route_summaries(log: str) -> Optional[Dict]:
     """`merge_summaries` for a caller that only has the log text.
 
@@ -243,7 +323,8 @@ def merge_route_summaries(log: str) -> Optional[Dict]:
         return None
     summaries = [json.loads(s) for s in raw]
     aborted = log.rfind(RECONCILE_ABORTED) > log.rfind(raw[-1])
-    return merge_summaries(summaries, aborted)
+    tiers = [json.loads(t) for t in TIER_SUMMARY_RE.findall(log)]
+    return fold_tier_summaries(merge_summaries(summaries, aborted), tiers)
 
 
 def summary_min(merged: Dict, name_cap: int = 20) -> Dict:
@@ -306,6 +387,16 @@ def summary_min(merged: Dict, name_cap: int = 20) -> Dict:
     if merged.get('finalize_excluded_nets'):
         out['finalize_excluded_nets'] = _names(
             merged['finalize_excluded_nets'])
+    # Nets broken outside every pass's scope: the deficit above already
+    # weighs them, and here they are NAMED (they appear in no other list).
+    if merged.get('coverage_gate_nets'):
+        out['broken_outside_scope'] = _names(merged['coverage_gate_nets'])
+    if merged.get('broken_by_run'):
+        out['broken_by_run'] = _names(merged['broken_by_run'])
+    if merged.get('clearance_tiers'):
+        out['clearance_tiers'] = [
+            {'clearance': t.get('clearance'), 'nets': len(t.get('nets') or []),
+             'failed': t.get('failed')} for t in merged['clearance_tiers']]
     return out
 
 

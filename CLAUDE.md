@@ -177,6 +177,22 @@ Validate routed boards against the *real* spec, with the right checker — most
     graded against. `grade_pad_legality` and `quench` keep the uncapped
     `max(base, netclass)` semantics: they write no project, so the class they
     price at is one KiCad will still enforce.
+  - **A call that mixes classes runs as CLEARANCE TIERS** (`route._clearance_tier_plan`):
+    the routing floor is ONE value per call -- the largest routed class -- so one 2 mm
+    HV net in a `--nets "*"` run priced every pad at 2 mm for every net and the first
+    0402 net could not leave its pads (measured: 0/106 nets in 15 min on a 4-layer HV
+    supply; tiered, 99/107 with every class clean in KiCad DRC). The call now routes
+    one class per pass, highest first, each a complete run against the earlier
+    tiers' copper (which it may not rip: they ride in as `!`-negations). Tier passes
+    print `JSON_TIER_SUMMARY_MIN (...)` / `JSON_TIER_PASS_SUMMARY`, the wrapper one
+    `JSON_TIER_SUMMARY` per tier, and the call's single `JSON_SUMMARY_MIN` /
+    `--json-out` folds them (`route_summary.fold_tier_summaries`; the log reader
+    `merge_route_summaries` does the same). File-to-file outermost calls only -- the
+    GUI (live `pcb_data`, `return_results`) still routes in one call.
+    `KICAD_CLEARANCE_TIERS=0` restores the single call. A per-net "excess margin"
+    alternative was tried and abandoned: the via paths (in-pad unblock, in-progress
+    rings, allowed rects) all assume the shared map already carries the routed
+    net's clearance, and it shipped HV vias 0.3 mm from foreign pads.
   - `--hole-to-hole-clearance` / `--board-edge-clearance` work the same way: omitted →
     the board's own `min_hole_to_hole` / `min_copper_edge_clearance` constraint (via
     `list_nets.board_constraint`), else the fixed default.
@@ -213,6 +229,17 @@ Validate routed boards against the *real* spec, with the right checker — most
   `--rip-existing-nets` — there is deliberately no CLI flag or GUI control.
   Rationale: a retry step once ripped a whole DDR match group and rerouted it
   unmatched (allwinner_h3_ddr3, 40/41 nets unmatched, one net stranded).
+  **The caller's scope binds every automatic rip too.** A net `!`-negated in
+  `--nets` is never a plane-finalize blocker (`repair_planes(never_rip_nets=)`),
+  and `--keep-input-copper` makes the input's nets read-only for automatic rip-up:
+  no pre-existing rip candidacy, and no finalize rip outside the run's scope
+  (explicit `--rip-existing-nets` still applies). Measured before: a GND pad repair
+  ripped a negated net to land a tap via, and keep-input-copper chain steps made
+  52-55 pre-existing rips each, breaking a connected net per step. A net a run
+  breaks outside every pass's scope is now in the tally: the improvement gate's
+  `lost` list folds into `coverage_gate_nets` (`fold_gate_losses`) and
+  `JSON_SUMMARY_MIN` names it (`broken_outside_scope`, `broken_by_run`); before,
+  only the gate's own line said so.
   **KiCad-LOCKED copper** (`segment.locked`/`via.locked`, both parse paths) makes
   its net never-rippable with NO override. **Impedance declarations** persist
   the same way (`net_impedance` key: ohms/differential/pair_gap/coplanar_gap):
